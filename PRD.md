@@ -15,12 +15,23 @@
 
 ## 功能需求
 1. 支持多协程并发读取 CSV，单连接写入 SQLite，批量提交。
-2. 表结构：`mid`(PK)、`job_intro`、`source`（来源目录名）、`status`（待处理/处理完成，默认待处理）、`category`（默认为空字符串）、`updated_at`（文件最后修改时间，RFC3339）。
+2. 表结构：`mid`(PK)、`job_intro`、`structured_json`（本地小模型返回的结构化 JSON）、`structured_summary`、`structured_responsibilities`（JSON 数组）、`structured_skills`（JSON 数组）、`structured_industry`、`structured_locations`（JSON 数组）、`structured_category_hints`（JSON 数组）、`structured_updated_at`（RFC3339）、`source`（来源目录名）、`status`（待处理/处理完成，默认待处理）、`category`（默认为空字符串）、`updated_at`（文件最后修改时间，RFC3339）。
 3. 每个来源目录（以 `data/` 下一级目录划分）最多导入 1000 条记录，默认值可通过 `-limit` 参数调整（0 表示不限制）。
 4. 数据去重：`mid` 主键，使用 `INSERT OR REPLACE` 覆盖。
 5. 性能：默认批量 5000，WAL + synchronous=NORMAL，支持 `-workers` 和 `-batch` 参数调优。
-6. 可靠性：遇到文件解析错误仅打印日志不中断。
+6. 可靠性：遇到文件解析错误或结构化失败仅打印日志不中断。
 
+### 结构化岗位摘要（更新）
+- importer 不再从 CSV 读取新岗位，而是直接查询 SQLite 中 `structured_summary` 为空的记录，逐条调用本地 `ollama` 服务 `qwen2:7b-instruct` 模型生成结构化结果。
+- 所有结构化请求通过 HTTP `POST http://localhost:11434/api/chat` 完成，并带 45s 超时控制；失败会回落为空字符串，日志中记录 `mid` 与异常原因。
+- `structured_json` 保存模型原始 JSON（格式化），其余字段（summary/responsibilities/skills/industry/locations/category_hints/updated_at）逐列展开，便于 SQL 分析与 query 端组合特征。
+- importer 的查询、模型调用与 UPDATE 均需打印详细日志（`[QUERY]`、`[MODEL]`、`[STORE]`），确保每条记录可追溯。
+- importer 以 10 个并发 worker 处理待结构化岗位；对每条数据在完成后额外输出 `[STATUS]` 日志，并在批量结束时输出 `[SUMMARY] total/success/failed`。模型请求超时时间为 5 分钟。
+
+### 向量查询策略（更新）
+- query 程序在构造向量输入时优先拼接 `structured_json` 中的摘要、职责、技能与大类猜测，再附上原始 `job_intro` 及来源/状态/分类字段，保证文本风格与职业分类库一致。
+- Chroma 集合固定使用 `cosine` 距离，查询阶段对返回的 `distance` 直接计算 `score = clamp(1 - distance, 0, 1)`，得分区间严格为 `[0,1]`，默认阈值仍为 `0.7`（等价于距离 ≤ 0.3）。
+- 日志中持续打印 `distance` 与换算后的 `similarity`，用于监控分布是否过于集中；当得分低于阈值直接跳过 CSV 输出。
 ## 非功能
 - 仅本地 SQLite，禁用远端 CI/CD。
 - 新文件编码 UTF-8，无 BOM；文档与注释中文。
@@ -29,3 +40,5 @@
 - 对每个来源目录执行抽样导入（默认 1000 条）后，`jobs` 表中各来源计数与日志一致。
 - `docs/IMPORT_GUIDE.md` 记录运行方法、字段含义与抽样策略。
 - `data/file_stats.csv` 若更新，仍需列出每个文件的记录数及总计。
+- 在 `jobs` 表中随机抽检 10 条记录，`structured_json` 必须是合法 JSON 并包含“岗位概述”“核心职责”等字段。
+- query 运行日志需展示 `distance` 与 `similarity`（0~1），确保高于 0.7 的记录被写入 CSV，且 CSV 中包含结构化信息映射出的分类字段。

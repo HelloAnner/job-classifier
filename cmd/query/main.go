@@ -12,6 +12,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -27,11 +28,12 @@ const (
 )
 
 type JobRecord struct {
-	MID      string
-	JobIntro string
-	Source   string
-	Status   string
-	Category string
+	MID        string
+	JobIntro   string
+	Structured string
+	Source     string
+	Status     string
+	Category   string
 }
 
 type EmbeddingService struct {
@@ -109,7 +111,7 @@ func (s *DatabaseService) Close() error {
 
 func (s *DatabaseService) GetAllJobs() ([]JobRecord, error) {
 	query := `
-		SELECT mid, job_intro, source, status, category
+		SELECT mid, job_intro, structured_json, source, status, category
 		FROM jobs
 		WHERE job_intro IS NOT NULL AND job_intro != ''
 		ORDER BY mid
@@ -124,7 +126,7 @@ func (s *DatabaseService) GetAllJobs() ([]JobRecord, error) {
 	var jobs []JobRecord
 	for rows.Next() {
 		var job JobRecord
-		err := rows.Scan(&job.MID, &job.JobIntro, &job.Source, &job.Status, &job.Category)
+		err := rows.Scan(&job.MID, &job.JobIntro, &job.Structured, &job.Source, &job.Status, &job.Category)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
@@ -370,6 +372,59 @@ func safeString(metadata map[string]interface{}, key string) string {
 	return ""
 }
 
+type structuredPayload struct {
+	Summary          string         `json:"岗位概述"`
+	Responsibilities []string       `json:"核心职责"`
+	Skills           []string       `json:"技能标签"`
+	Industry         string         `json:"行业"`
+	Locations        []string       `json:"工作地点"`
+	CategoryHints    []categoryHint `json:"可能对应的大类"`
+}
+
+type categoryHint struct {
+	Name       string  `json:"名称"`
+	Confidence float64 `json:"信心"`
+}
+
+func formatStructuredText(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	var payload structuredPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return raw
+	}
+	var sections []string
+	if payload.Summary != "" {
+		sections = append(sections, fmt.Sprintf("岗位概述: %s", payload.Summary))
+	}
+	if len(payload.Responsibilities) > 0 {
+		sections = append(sections, fmt.Sprintf("核心职责: %s", strings.Join(payload.Responsibilities, "；")))
+	}
+	if len(payload.Skills) > 0 {
+		sections = append(sections, fmt.Sprintf("技能标签: %s", strings.Join(payload.Skills, "；")))
+	}
+	if payload.Industry != "" {
+		sections = append(sections, fmt.Sprintf("行业: %s", payload.Industry))
+	}
+	if len(payload.Locations) > 0 {
+		sections = append(sections, fmt.Sprintf("工作地点: %s", strings.Join(payload.Locations, "；")))
+	}
+	if len(payload.CategoryHints) > 0 {
+		var hints []string
+		for _, hint := range payload.CategoryHints {
+			if hint.Name == "" {
+				continue
+			}
+			hints = append(hints, fmt.Sprintf("%s(信心%.2f)", hint.Name, hint.Confidence))
+		}
+		if len(hints) > 0 {
+			sections = append(sections, fmt.Sprintf("大类猜测: %s", strings.Join(hints, "；")))
+		}
+	}
+	return strings.Join(sections, "\n")
+}
+
 func normalizeEmbedding(vec []float32) ([]float32, error) {
 	var sum float64
 	for _, v := range vec {
@@ -391,22 +446,16 @@ func normalizeEmbedding(vec []float32) ([]float32, error) {
 	return normalized, nil
 }
 
-func l2DistanceToSimilarity(distance float64) float64 {
-	// 将单位向量间的 L2 距离转换为余弦相似度，并映射到 0~1 区间
-	cosSim := 1 - (distance*distance)/2
-	if cosSim > 1 {
-		cosSim = 1
-	} else if cosSim < -1 {
-		cosSim = -1
-	}
-	similarity := (cosSim + 1) / 2
-	if similarity < 0 {
+func cosineDistanceToScore(distance float64) float64 {
+	// Chroma 在 cosine 度量下返回 distance=1-cos_sim，直接映射为可解释的 0-1 分数
+	score := 1 - distance
+	if score < 0 {
 		return 0
 	}
-	if similarity > 1 {
+	if score > 1 {
 		return 1
 	}
-	return similarity
+	return score
 }
 
 type QueryProcessor struct {
@@ -473,9 +522,16 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 			log.Printf("Progress: %d/%d (%.1f%%)", i+1, totalJobs, float64(i+1)/float64(totalJobs)*100)
 		}
 
-		// Use complete job description for vectorization
-		fullDescription := fmt.Sprintf("岗位描述: %s\n来源: %s\n状态: %s\n分类: %s",
-			job.JobIntro, job.Source, job.Status, job.Category)
+		structuredText := formatStructuredText(job.Structured)
+		var descParts []string
+		if structuredText != "" {
+			descParts = append(descParts, structuredText)
+		}
+		descParts = append(descParts, fmt.Sprintf("岗位描述: %s", job.JobIntro))
+		descParts = append(descParts, fmt.Sprintf("来源: %s", job.Source))
+		descParts = append(descParts, fmt.Sprintf("状态: %s", job.Status))
+		descParts = append(descParts, fmt.Sprintf("分类: %s", job.Category))
+		fullDescription := strings.Join(descParts, "\n")
 
 		embedding, err := p.embeddingSvc.GetEmbedding(fullDescription)
 		if err != nil {
@@ -508,7 +564,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 
 		for j := 0; j < len(queryResp.Distances[0]); j++ {
 			distance := queryResp.Distances[0][j]
-			similarity := l2DistanceToSimilarity(distance)
+			similarity := cosineDistanceToScore(distance)
 
 			if similarity > bestSimilarity {
 				bestSimilarity = similarity

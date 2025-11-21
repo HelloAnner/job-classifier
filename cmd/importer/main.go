@@ -1,16 +1,16 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"os"
-	"path/filepath"
-	"runtime"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,52 +20,118 @@ import (
 )
 
 const (
-	defaultStatus = "待处理"
+	defaultStatus    = "待处理"
+	ollamaChatURL    = "http://localhost:11434/api/chat"
+	structModel      = "qwen2:7b-instruct"
+	structReqTimeout = 5 * time.Minute
+	workerCount      = 10
 )
 
-// Record 表示一条入库记录。
-type Record struct {
-	Mid      string
-	Intro    string
-	Source   string
-	Status   string
-	Category string
-	Updated  string
+type jobRecord struct {
+	MID      string `json:"mid"`
+	Intro    string `json:"intro"`
+	Source   string `json:"source"`
+	Category string `json:"category"`
+	Status   string `json:"status"`
 }
 
-// fileTask 将文件路径与所属来源目录、修改时间绑定，避免重复计算。
-type fileTask struct {
-	path    string
-	source  string
-	modTime time.Time
+type jobTask struct {
+	Index int
+	Total int
+	Job   jobRecord
 }
 
-// quotaManager 负责控制每个来源目录的最大写入条数。
-type quotaManager struct {
-	limit  int
-	counts map[string]int
-	mu     sync.Mutex
+type structuredPayload struct {
+	Summary          string          `json:"岗位概述"`
+	Responsibilities json.RawMessage `json:"核心职责"`
+	Skills           json.RawMessage `json:"技能标签"`
+	Industry         string          `json:"行业"`
+	Locations        json.RawMessage `json:"工作地点"`
+	CategoryHints    json.RawMessage `json:"可能对应的大类"`
 }
 
-func newQuotaManager(limit int) *quotaManager {
-	return &quotaManager{limit: limit, counts: make(map[string]int)}
+type StructuringService struct {
+	client *http.Client
 }
 
-func (q *quotaManager) Allow(source string) bool {
-	if q == nil {
-		return true
+type chatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type chatRequest struct {
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
+}
+
+type chatResponse struct {
+	Message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"message"`
+}
+
+func NewStructuringService() *StructuringService {
+	return &StructuringService{
+		client: &http.Client{Timeout: structReqTimeout},
 	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.limit <= 0 {
-		q.counts[source]++
-		return true
+}
+
+func main() {
+	var (
+		dbPath string
+		limit  int
+	)
+
+	flag.StringVar(&dbPath, "db", "data/jobs.db", "SQLite 文件路径")
+	flag.IntVar(&limit, "limit", 0, "本次最多处理多少条岗位（0 表示全部）")
+	flag.Parse()
+
+	ctx := context.Background()
+
+	db, err := initDB(dbPath)
+	if err != nil {
+		log.Fatalf("初始化数据库失败: %v", err)
 	}
-	if q.counts[source] >= q.limit {
-		return false
+	defer db.Close()
+
+	jobs, err := fetchPendingJobs(ctx, db, limit)
+	if err != nil {
+		log.Fatalf("查询待处理岗位失败: %v", err)
 	}
-	q.counts[source]++
-	return true
+
+	if len(jobs) == 0 {
+		log.Println("没有需要结构化的岗位，退出。")
+		return
+	}
+
+	log.Printf("本次待处理 %d 条岗位", len(jobs))
+
+	structSvc := NewStructuringService()
+
+	tasks := make(chan jobTask)
+	var wg sync.WaitGroup
+	var successCount atomic.Int64
+	var failureCount atomic.Int64
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				handleJob(ctx, db, structSvc, task, &successCount, &failureCount)
+			}
+		}()
+	}
+
+	for idx, job := range jobs {
+		tasks <- jobTask{Index: idx + 1, Total: len(jobs), Job: job}
+	}
+	close(tasks)
+	wg.Wait()
+
+	log.Printf("[SUMMARY] total=%d success=%d failed=%d", len(jobs), successCount.Load(), failureCount.Load())
 }
 
 func initDB(dbPath string) (*sql.DB, error) {
@@ -74,289 +140,357 @@ func initDB(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-
-	pragmas := []string{
-		"PRAGMA mmap_size=134217728;",
-		"PRAGMA temp_store=MEMORY;",
+	if err := db.Ping(); err != nil {
+		return nil, err
 	}
-	for _, p := range pragmas {
-		if _, err = db.Exec(p); err != nil {
+
+	schema := []string{
+		`CREATE TABLE IF NOT EXISTS jobs (
+            mid TEXT PRIMARY KEY,
+            job_intro TEXT,
+            structured_json TEXT,
+            source TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT '待处理',
+            category TEXT,
+            updated_at TEXT NOT NULL,
+            structured_summary TEXT,
+            structured_responsibilities TEXT,
+            structured_skills TEXT,
+            structured_industry TEXT,
+            structured_locations TEXT,
+            structured_category_hints TEXT,
+            structured_updated_at TEXT
+        );`,
+	}
+
+	for _, stmt := range schema {
+		if _, err := db.Exec(stmt); err != nil {
 			return nil, err
 		}
 	}
 
-	ddl := `CREATE TABLE IF NOT EXISTS jobs (
-                mid TEXT PRIMARY KEY,
-                job_intro TEXT,
-                source TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT '待处理',
-                category TEXT,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);
-            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-            CREATE INDEX IF NOT EXISTS idx_jobs_category ON jobs(category);`
-	if _, err = db.Exec(ddl); err != nil {
-		return nil, err
+	ensureCols := []string{
+		"structured_json",
+		"structured_summary",
+		"structured_responsibilities",
+		"structured_skills",
+		"structured_industry",
+		"structured_locations",
+		"structured_category_hints",
+		"structured_updated_at",
 	}
+
+	for _, col := range ensureCols {
+		alter := fmt.Sprintf("ALTER TABLE jobs ADD COLUMN %s TEXT", col)
+		if _, err := db.Exec(alter); err != nil {
+			if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+				return nil, err
+			}
+		}
+	}
+
 	return db, nil
 }
 
-func main() {
-	var (
-		rootDir string
-		dbPath  string
-		workers int
-		batch   int
-		limit   int
-	)
-	flag.StringVar(&rootDir, "root", "data", "数据根目录，默认指向 data 下的各平台子目录")
-	flag.StringVar(&dbPath, "db", "data/jobs.db", "SQLite 文件路径")
-	flag.IntVar(&workers, "workers", runtime.NumCPU()*2, "CSV 解析并发数")
-	flag.IntVar(&batch, "batch", 5000, "提交批量大小")
-	flag.IntVar(&limit, "limit", 1000, "每个来源目录的最大写入条数（默认 1000，0 表示不限制）")
-	flag.Parse()
+type sqlJobRow struct {
+	mid      string
+	intro    string
+	source   string
+	category sql.NullString
+	status   string
+}
 
-	start := time.Now()
-	absRoot, err := filepath.Abs(rootDir)
+func fetchPendingJobs(ctx context.Context, db *sql.DB, limit int) ([]jobRecord, error) {
+	baseQuery := `SELECT mid, job_intro, source, IFNULL(category, ''), status
+FROM jobs
+WHERE job_intro IS NOT NULL AND job_intro != ''
+  AND (structured_summary IS NULL OR structured_summary = '')
+ORDER BY updated_at`
+
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		baseQuery += " LIMIT ?"
+		rows, err = db.QueryContext(ctx, baseQuery, limit)
+	} else {
+		rows, err = db.QueryContext(ctx, baseQuery)
+	}
 	if err != nil {
-		log.Fatalf("解析 root 目录失败: %v", err)
+		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		log.Fatalf("创建 data 目录失败: %v", err)
-	}
+	defer rows.Close()
 
-	db, err := initDB(dbPath)
+	var jobs []jobRecord
+	for rows.Next() {
+		var row sqlJobRow
+		if err := rows.Scan(&row.mid, &row.intro, &row.source, &row.category, &row.status); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, jobRecord{
+			MID:      row.mid,
+			Intro:    row.intro,
+			Source:   row.source,
+			Category: row.category.String,
+			Status:   row.status,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+func handleJob(ctx context.Context, db *sql.DB, structSvc *StructuringService, task jobTask, successCount, failureCount *atomic.Int64) {
+	job := task.Job
+	queryLog := map[string]interface{}{
+		"index": task.Index,
+		"total": task.Total,
+		"job":   job,
+	}
+	log.Printf("[QUERY] %s", prettyJSON(queryLog))
+
+	payload, rawJSON, err := structSvc.BuildStructured(ctx, job)
 	if err != nil {
-		log.Fatalf("初始化数据库失败: %v", err)
+		log.Printf("[ERROR] 调用模型失败 mid=%s: %v", job.MID, err)
+		failureCount.Add(1)
+		logJobStatus(job.MID, "failed", successCount.Load(), failureCount.Load(), task.Total, err.Error())
+		return
 	}
-	defer db.Close()
+	if payload == nil {
+		log.Printf("[WARN] 模型未返回结构化结果 mid=%s", job.MID)
+		failureCount.Add(1)
+		logJobStatus(job.MID, "failed", successCount.Load(), failureCount.Load(), task.Total, "empty payload")
+		return
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	if err := updateJob(ctx, db, job.MID, rawJSON, payload); err != nil {
+		log.Printf("[ERROR] 更新数据库失败 mid=%s: %v", job.MID, err)
+		failureCount.Add(1)
+		logJobStatus(job.MID, "failed", successCount.Load(), failureCount.Load(), task.Total, err.Error())
+		return
+	}
+
+	successCount.Add(1)
+	storeLog := map[string]interface{}{
+		"mid":              job.MID,
+		"stored_at":        time.Now().UTC().Format(time.RFC3339),
+		"summary":          payload.Summary,
+		"structured_raw":   parseRawJSON(rawJSON),
+		"responsibilities": rawToInterface(payload.Responsibilities),
+		"skills":           rawToInterface(payload.Skills),
+		"industry":         payload.Industry,
+		"locations":        rawToInterface(payload.Locations),
+		"category_hints":   rawToInterface(payload.CategoryHints),
+	}
+	log.Printf("[STORE] %s", prettyJSON(storeLog))
+	logJobStatus(job.MID, "success", successCount.Load(), failureCount.Load(), task.Total, "")
+}
+
+func (s *StructuringService) BuildStructured(ctx context.Context, job jobRecord) (*structuredPayload, string, error) {
+	text := strings.TrimSpace(job.Intro)
+	if text == "" {
+		return nil, "", nil
+	}
+
+	categoryInfo := job.Category
+	if categoryInfo == "" {
+		categoryInfo = "未分类"
+	}
+
+	prompt := fmt.Sprintf(`请阅读以下岗位信息，并生成结构化 JSON。要求：
+1. 仅输出 JSON，不要添加额外说明。
+2. JSON 字段：岗位概述(一句话)、核心职责(数组)、技能标签(数组)、行业(字符串，可为空)、工作地点(数组)、可能对应的大类(数组，元素包含名称与信心0-1之间的小数)。
+3. 若文本中找不到对应信息，请使用空字符串或空数组。
+岗位ID: %s
+来源: %s
+已有分类: %s
+岗位描述:
+%s`, job.MID, job.Source, categoryInfo, text)
+	log.Printf("[MODEL-REQ] %s", prettyJSON(map[string]interface{}{
+		"mid":    job.MID,
+		"model":  structModel,
+		"prompt": prompt,
+	}))
+
+	reqBody := chatRequest{
+		Model: structModel,
+		Messages: []chatMessage{
+			{Role: "system", Content: "你是一名岗位结构化助手，只能输出 JSON。"},
+			{Role: "user", Content: prompt},
+		},
+		Stream: false,
+	}
+
+	buf, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, "", err
+	}
+
+	ctxReq, cancel := context.WithTimeout(ctx, structReqTimeout)
 	defer cancel()
 
-	rowsCh := make(chan Record, 10000)
-	files := make(chan fileTask, workers)
-	var wg sync.WaitGroup
+	req, err := http.NewRequestWithContext(ctxReq, http.MethodPost, ollamaChatURL, bytes.NewReader(buf))
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
 
-	stats := make(map[string]int64)
-	var statsMu sync.Mutex
-	var inserted atomic.Int64
-	quota := newQuotaManager(limit)
-	writerErrCh := make(chan error, 1)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
 
-	go func() {
-		var (
-			tx   *sql.Tx
-			stmt *sql.Stmt
-		)
-
-		begin := func() error {
-			var err error
-			tx, err = db.Begin()
-			if err != nil {
-				return err
-			}
-			stmt, err = tx.Prepare(`INSERT OR REPLACE INTO jobs(mid, job_intro, source, status, category, updated_at) VALUES(?,?,?,?,?,?)`)
-			if err != nil {
-				tx.Rollback()
-				tx = nil
-			}
-			return err
-		}
-
-		commit := func() error {
-			if stmt != nil {
-				if err := stmt.Close(); err != nil {
-					return err
-				}
-				stmt = nil
-			}
-			if tx != nil {
-				if err := tx.Commit(); err != nil {
-					return err
-				}
-				tx = nil
-			}
-			return nil
-		}
-
-		reset := func() error {
-			if err := commit(); err != nil {
-				return err
-			}
-			return begin()
-		}
-
-		if err := begin(); err != nil {
-			writerErrCh <- err
-			cancel()
-			return
-		}
-		defer func() {
-			if tx != nil {
-				tx.Rollback()
-			}
-		}()
-
-		count := 0
-		for r := range rowsCh {
-			if _, err := stmt.Exec(r.Mid, r.Intro, r.Source, r.Status, r.Category, r.Updated); err != nil {
-				writerErrCh <- err
-				cancel()
-				return
-			}
-			count++
-			if batch > 0 && count%batch == 0 {
-				if err := reset(); err != nil {
-					writerErrCh <- err
-					cancel()
-					return
-				}
-			}
-			inserted.Add(1)
-			statsMu.Lock()
-			stats[r.Source]++
-			statsMu.Unlock()
-		}
-
-		if err := commit(); err != nil {
-			writerErrCh <- err
-			cancel()
-			return
-		}
-		writerErrCh <- nil
-	}()
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range files {
-				if ctx.Err() != nil {
-					continue
-				}
-				if err := processFile(ctx, task, rowsCh, quota); err != nil {
-					log.Printf("处理文件 %s 出错: %v", task.path, err)
-				}
-			}
-		}()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("模型返回错误码 %d: %s", resp.StatusCode, string(body))
 	}
 
-	walkErr := filepath.WalkDir(absRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if ctx.Err() != nil {
-			return context.Canceled
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(d.Name()), ".csv") {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		relSource := detectSource(absRoot, path)
-		select {
-		case <-ctx.Done():
-			return context.Canceled
-		case files <- fileTask{path: path, source: relSource, modTime: info.ModTime()}:
-		}
+	var chatResp chatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return nil, "", fmt.Errorf("解析模型响应失败: %w", err)
+	}
+
+	content := strings.TrimSpace(chatResp.Message.Content)
+	log.Printf("[MODEL-RESP] mid=%s raw=%s", job.MID, content)
+	rawJSON, err := extractJSON(content)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var payload structuredPayload
+	if err := json.Unmarshal([]byte(rawJSON), &payload); err != nil {
+		return nil, "", fmt.Errorf("解析结构化 JSON 失败: %w", err)
+	}
+
+	normalized, err := normalizeJSON(rawJSON)
+	if err != nil {
+		return nil, "", err
+	}
+
+	log.Printf("[MODEL-PAYLOAD] %s", prettyJSON(map[string]interface{}{
+		"mid":                 job.MID,
+		"summary":             payload.Summary,
+		"responsibilities":    rawToInterface(payload.Responsibilities),
+		"skills":              rawToInterface(payload.Skills),
+		"industry":            payload.Industry,
+		"locations":           rawToInterface(payload.Locations),
+		"category_hints":      rawToInterface(payload.CategoryHints),
+		"normalized_response": parseRawJSON(normalized),
+	}))
+
+	return &payload, normalized, nil
+}
+
+func updateJob(ctx context.Context, db *sql.DB, mid string, rawJSON string, payload *structuredPayload) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	resps := rawToJSONString(payload.Responsibilities, "[]")
+	skills := rawToJSONString(payload.Skills, "[]")
+	locations := rawToJSONString(payload.Locations, "[]")
+	categories := rawToJSONString(payload.CategoryHints, "[]")
+
+	_, err := db.ExecContext(ctx, `UPDATE jobs
+        SET structured_json = ?,
+            structured_summary = ?,
+            structured_responsibilities = ?,
+            structured_skills = ?,
+            structured_industry = ?,
+            structured_locations = ?,
+            structured_category_hints = ?,
+            structured_updated_at = ?
+        WHERE mid = ?`,
+		nullIfEmpty(rawJSON),
+		payload.Summary,
+		resps,
+		skills,
+		payload.Industry,
+		locations,
+		categories,
+		now,
+		mid,
+	)
+
+	return err
+}
+
+func extractJSON(text string) (string, error) {
+	start := strings.Index(text, "{")
+	end := strings.LastIndex(text, "}")
+	if start == -1 || end == -1 || end <= start {
+		return "", errors.New("未找到 JSON 内容")
+	}
+	candidate := strings.TrimSpace(text[start : end+1])
+	if !json.Valid([]byte(candidate)) {
+		return "", errors.New("返回内容不是合法 JSON")
+	}
+	return candidate, nil
+}
+
+func normalizeJSON(raw string) (string, error) {
+	var v interface{}
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return "", err
+	}
+	buf, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func nullIfEmpty(s string) interface{} {
+	if strings.TrimSpace(s) == "" {
 		return nil
-	})
-	close(files)
-	if walkErr != nil && !errors.Is(walkErr, context.Canceled) {
-		log.Fatalf("遍历目录失败: %v", walkErr)
 	}
-
-	wg.Wait()
-	close(rowsCh)
-
-	if err := <-writerErrCh; err != nil {
-		log.Fatalf("写入失败: %v", err)
-	}
-
-	duration := time.Since(start)
-	total := inserted.Load()
-	statsMu.Lock()
-	log.Printf("导入完成，共写入 %d 行，用时 %s", total, duration)
-	for source, c := range stats {
-		log.Printf("%s: %d", source, c)
-	}
-	statsMu.Unlock()
+	return s
 }
 
-func detectSource(root, path string) string {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return filepath.Base(filepath.Dir(path))
+func rawToJSONString(raw json.RawMessage, defaultVal string) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return defaultVal
 	}
-	rel = filepath.ToSlash(rel)
-	parts := strings.Split(rel, "/")
-	if len(parts) == 0 || parts[0] == "." {
-		return filepath.Base(filepath.Dir(path))
+	if !json.Valid(trimmed) {
+		return defaultVal
 	}
-	return parts[0]
+	return string(trimmed)
 }
 
-func processFile(ctx context.Context, task fileTask, rowsCh chan<- Record, quota *quotaManager) error {
-	f, err := os.Open(task.path)
-	if err != nil {
-		return err
+func rawToInterface(raw json.RawMessage) interface{} {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
 	}
-	defer f.Close()
+	var v interface{}
+	if err := json.Unmarshal(trimmed, &v); err != nil {
+		return string(trimmed)
+	}
+	return v
+}
 
-	reader := bufio.NewReader(f)
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024*10)
-	isHeader := true
-	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		line := scanner.Text()
-		if isHeader {
-			isHeader = false
-			if strings.HasPrefix(strings.ToLower(line), "mid") {
-				continue
-			}
-		}
-		idx := strings.IndexByte(line, ',')
-		if idx <= 0 {
-			continue
-		}
-		if quota != nil && !quota.Allow(task.source) {
-			break
-		}
-		mid := line[:idx]
-		intro := ""
-		if len(line) > idx+1 {
-			intro = line[idx+1:]
-		}
-		record := Record{
-			Mid:      mid,
-			Intro:    intro,
-			Source:   task.source,
-			Status:   defaultStatus,
-			Category: "",
-			Updated:  task.modTime.UTC().Format(time.RFC3339),
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case rowsCh <- record:
-		}
+func prettyJSON(v interface{}) string {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Sprintf("%+v", v)
 	}
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("扫描文件失败 %s: %w", task.path, err)
+	return string(data)
+}
+
+func parseRawJSON(raw string) interface{} {
+	if strings.TrimSpace(raw) == "" {
+		return nil
 	}
-	return nil
+	var v interface{}
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		return raw
+	}
+	return v
+}
+
+func logJobStatus(mid, state string, success, failed int64, total int, extra string) {
+	if strings.TrimSpace(extra) != "" {
+		log.Printf("[STATUS] mid=%s status=%s success=%d failed=%d total=%d msg=%s", mid, state, success, failed, total, extra)
+		return
+	}
+	log.Printf("[STATUS] mid=%s status=%s success=%d failed=%d total=%d", mid, state, success, failed, total)
 }
