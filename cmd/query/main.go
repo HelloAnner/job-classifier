@@ -365,6 +365,23 @@ func (w *CSVWriter) Close() error {
 }
 
 func truncate(s string, maxLen int) string {
+	// 清理换行符和回车符，替换为空格
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+
+	// 清理制表符，替换为空格
+	s = strings.ReplaceAll(s, "\t", " ")
+
+	// 清理多余的连续空格
+	for strings.Contains(s, "  ") {
+		s = strings.ReplaceAll(s, "  ", " ")
+	}
+
+	// 去除开头和结尾的空白
+	s = strings.TrimSpace(s)
+
+	// 如果清理后的字符串仍然超过最大长度，则截断
 	if len(s) <= maxLen {
 		return s
 	}
@@ -374,6 +391,17 @@ func truncate(s string, maxLen int) string {
 func safeString(metadata map[string]interface{}, key string) string {
 	if val, ok := metadata[key]; ok && val != nil {
 		if str, ok := val.(string); ok {
+			// 清理换行符，替换为空格
+			str = strings.ReplaceAll(str, "\r\n", " ")
+			str = strings.ReplaceAll(str, "\n", " ")
+			str = strings.ReplaceAll(str, "\r", " ")
+
+			// 清理制表符
+			str = strings.ReplaceAll(str, "\t", " ")
+
+			// 转义双引号（CSV 格式要求：双引号内的双引号需要双写）
+			str = strings.ReplaceAll(str, "\"", "\"\"")
+
 			return str
 		}
 	}
