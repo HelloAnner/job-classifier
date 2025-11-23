@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -20,20 +21,27 @@ import (
 
 const (
 	ollamaAPIURL        = "http://localhost:11434/api/embeddings"
-	embeddingModel      = "bge-zh"
+	embeddingModel      = "quentinz/bge-large-zh-v1.5"
 	chromaDBURL         = "http://localhost:8000"
 	collectionName      = "job_classification"
 	databasePath        = "data/jobs.db"
-	similarityThreshold = 0.7
+	similarityThreshold = 0.55
 )
 
 type JobRecord struct {
 	MID        string
 	JobIntro   string
-	Structured string
+	Structured sql.NullString
 	Source     string
 	Status     string
 	Category   string
+}
+
+func (j JobRecord) StructuredJSON() string {
+	if j.Structured.Valid {
+		return j.Structured.String
+	}
+	return ""
 }
 
 type EmbeddingService struct {
@@ -465,6 +473,14 @@ type QueryProcessor struct {
 	csvWriter    *CSVWriter
 }
 
+type jobResult struct {
+	job        JobRecord
+	similarity float64
+	metadata   map[string]interface{}
+	matched    bool
+	err        error
+}
+
 func NewQueryProcessor(ctx context.Context, dbPath string) (*QueryProcessor, error) {
 	dbService, err := NewDatabaseService(dbPath)
 	if err != nil {
@@ -497,8 +513,9 @@ func (p *QueryProcessor) Close() {
 	p.csvWriter.Close()
 }
 
+const workerCount = 10
+
 func (p *QueryProcessor) Process(ctx context.Context) error {
-	// Get ChromaDB record count first
 	recordCount, err := p.chromaRepo.GetCount(ctx)
 	if err != nil {
 		log.Printf("Warning: Failed to get ChromaDB record count: %v", err)
@@ -514,96 +531,56 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 	totalJobs := len(jobs)
 	log.Printf("Found %d jobs to process", totalJobs)
 
-	var processed, matched int
+	jobsCh := make(chan JobRecord)
+	resultsCh := make(chan jobResult)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobsCh {
+				resultsCh <- p.processSingleJob(ctx, job)
+			}
+		}()
+	}
+
+	go func() {
+		for _, job := range jobs {
+			jobsCh <- job
+		}
+		close(jobsCh)
+		wg.Wait()
+		close(resultsCh)
+	}()
+
+	processed := 0
+	matched := 0
 	startTime := time.Now()
 
-	for i, job := range jobs {
-		if (i+1)%10 == 0 || i == 0 {
-			log.Printf("Progress: %d/%d (%.1f%%)", i+1, totalJobs, float64(i+1)/float64(totalJobs)*100)
-		}
-
-		structuredText := formatStructuredText(job.Structured)
-		var descParts []string
-		if structuredText != "" {
-			descParts = append(descParts, structuredText)
-		}
-		descParts = append(descParts, fmt.Sprintf("岗位描述: %s", job.JobIntro))
-		descParts = append(descParts, fmt.Sprintf("来源: %s", job.Source))
-		descParts = append(descParts, fmt.Sprintf("状态: %s", job.Status))
-		descParts = append(descParts, fmt.Sprintf("分类: %s", job.Category))
-		fullDescription := strings.Join(descParts, "\n")
-
-		embedding, err := p.embeddingSvc.GetEmbedding(fullDescription)
-		if err != nil {
-			log.Printf("Warning: Failed to get embedding for job %s: %v", job.MID, err)
-			continue
-		}
-
-		embedding, err = normalizeEmbedding(embedding)
-		if err != nil {
-			log.Printf("Warning: Failed to normalize embedding for job %s: %v", job.MID, err)
-			continue
-		}
-
-		queryResp, err := p.chromaRepo.Query(ctx, embedding)
-		if err != nil {
-			log.Printf("Warning: Failed to query ChromaDB for job %s: %v", job.MID, err)
-			continue
-		}
-
+	for res := range resultsCh {
 		processed++
+		if processed == 1 || processed%50 == 0 {
+			log.Printf("Progress: %d/%d (%.1f%%)", processed, totalJobs, float64(processed)/float64(totalJobs)*100)
+		}
 
-		if len(queryResp.Distances) == 0 || len(queryResp.Distances[0]) == 0 {
+		if res.err != nil {
+			log.Println(res.err)
 			continue
 		}
 
-		// Find the best match among all returned results
-		bestSimilarity := 0.0
-		bestDistance := 0.0
-		bestIndex := 0
-
-		for j := 0; j < len(queryResp.Distances[0]); j++ {
-			distance := queryResp.Distances[0][j]
-			similarity := cosineDistanceToScore(distance)
-
-			if similarity > bestSimilarity {
-				bestSimilarity = similarity
-				bestDistance = distance
-				bestIndex = j
+		if res.matched {
+			matched++
+			if err := p.csvWriter.WriteRow(res.job, res.similarity, res.metadata); err != nil {
+				log.Printf("Warning: Failed to write CSV row for job %s: %v", res.job.MID, err)
+				continue
 			}
-		}
-
-		// Log the best similarity for this job with description preview
-		descPreview := job.JobIntro
-		if len(descPreview) > 80 {
-			descPreview = descPreview[:80] + "..."
-		}
-		log.Printf("Job[%s]: distance=%.4f, similarity=%.4f (best among %d results)",
-			descPreview, bestDistance, bestSimilarity, len(queryResp.Distances[0]))
-
-		if bestSimilarity < similarityThreshold {
-			continue
-		}
-
-		matched++
-
-		// Use the best match metadata
-		var metadata map[string]interface{}
-		if len(queryResp.Metadatas) > 0 && len(queryResp.Metadatas[0]) > bestIndex {
-			metadata = queryResp.Metadatas[0][bestIndex]
-		}
-
-		if err := p.csvWriter.WriteRow(job, bestSimilarity, metadata); err != nil {
-			log.Printf("Warning: Failed to write CSV row for job %s: %v", job.MID, err)
-			continue
-		}
-
-		// Flush CSV every 100 matched records
-		if matched%100 == 0 {
-			if err := p.csvWriter.Flush(); err != nil {
-				log.Printf("Warning: Failed to flush CSV writer: %v", err)
-			} else {
-				log.Printf("Auto-saved CSV after %d matched records", matched)
+			if matched%100 == 0 {
+				if err := p.csvWriter.Flush(); err != nil {
+					log.Printf("Warning: Failed to flush CSV writer: %v", err)
+				} else {
+					log.Printf("Auto-saved CSV after %d matched records", matched)
+				}
 			}
 		}
 	}
@@ -616,6 +593,81 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 	log.Printf("Time elapsed: %.2f seconds", elapsed.Seconds())
 
 	return nil
+}
+
+func (p *QueryProcessor) processSingleJob(ctx context.Context, job JobRecord) jobResult {
+	structuredText := formatStructuredText(job.StructuredJSON())
+	var descParts []string
+	if structuredText != "" {
+		descParts = append(descParts, structuredText)
+	}
+	descParts = append(descParts, fmt.Sprintf("岗位描述: %s", job.JobIntro))
+	descParts = append(descParts, fmt.Sprintf("来源: %s", job.Source))
+	descParts = append(descParts, fmt.Sprintf("状态: %s", job.Status))
+	descParts = append(descParts, fmt.Sprintf("分类: %s", job.Category))
+	fullDescription := strings.Join(descParts, "\n")
+
+	embedding, err := p.embeddingSvc.GetEmbedding(fullDescription)
+	if err != nil {
+		return jobResult{job: job, err: fmt.Errorf("Warning: Failed to get embedding for job %s: %v", job.MID, err)}
+	}
+
+	embedding, err = normalizeEmbedding(embedding)
+	if err != nil {
+		return jobResult{job: job, err: fmt.Errorf("Warning: Failed to normalize embedding for job %s: %v", job.MID, err)}
+	}
+
+	queryResp, err := p.chromaRepo.Query(ctx, embedding)
+	if err != nil {
+		return jobResult{job: job, err: fmt.Errorf("Warning: Failed to query ChromaDB for job %s: %v", job.MID, err)}
+	}
+
+	if len(queryResp.Distances) == 0 || len(queryResp.Distances[0]) == 0 {
+		preview := previewIntro(job.JobIntro)
+		log.Printf("Job[%s]: no candidates returned", preview)
+		return jobResult{job: job}
+	}
+
+	bestSimilarity := 0.0
+	bestDistance := 0.0
+	bestIndex := 0
+
+	for j := 0; j < len(queryResp.Distances[0]); j++ {
+		distance := queryResp.Distances[0][j]
+		similarity := cosineDistanceToScore(distance)
+		if similarity > bestSimilarity {
+			bestSimilarity = similarity
+			bestDistance = distance
+			bestIndex = j
+		}
+	}
+
+	preview := previewIntro(job.JobIntro)
+	log.Printf("Job[%s]: distance=%.4f, similarity=%.4f (best among %d results)",
+		preview, bestDistance, bestSimilarity, len(queryResp.Distances[0]))
+
+	if bestSimilarity < similarityThreshold {
+		return jobResult{job: job}
+	}
+
+	var metadata map[string]interface{}
+	if len(queryResp.Metadatas) > 0 && len(queryResp.Metadatas[0]) > bestIndex {
+		metadata = queryResp.Metadatas[0][bestIndex]
+	}
+
+	return jobResult{
+		job:        job,
+		similarity: bestSimilarity,
+		metadata:   metadata,
+		matched:    true,
+	}
+}
+
+func previewIntro(intro string) string {
+	if len(intro) > 80 {
+		return intro[:80] + "..."
+	}
+	return intro
 }
 
 func main() {

@@ -19,7 +19,7 @@ import (
 
 const (
 	ollamaAPIURL       = "http://localhost:11434/api/embeddings"
-	embeddingModel     = "bge-zh"
+	embeddingModel     = "quentinz/bge-large-zh-v1.5"
 	chromaDBURL        = "http://localhost:8000"
 	collectionName     = "job_classification"
 	embeddingDimension = 1024
@@ -27,17 +27,21 @@ const (
 )
 
 type JobClassification struct {
-	中类       string `json:"中类"`
-	中类含义     string `json:"中类含义"`
-	大类       string `json:"大类"`
-	大类含义     string `json:"大类含义"`
-	小类       string `json:"小类"`
-	小类含义     string `json:"小类含义"`
-	源行号      string `json:"源行号"`
-	细类主要工作任务 string `json:"细类主要工作任务"`
-	细类包含工种   string `json:"细类包含工种"`
-	细类含义     string `json:"细类含义"`
-	细类编码     string `json:"细类（职业）"`
+	中类                  string   `json:"中类"`
+	中类含义                string   `json:"中类含义"`
+	大类                  string   `json:"大类"`
+	大类含义                string   `json:"大类含义"`
+	小类                  string   `json:"小类"`
+	小类含义                string   `json:"小类含义"`
+	源行号                 string   `json:"源行号"`
+	细类主要工作任务            string   `json:"细类主要工作任务"`
+	细类包含工种              string   `json:"细类包含工种"`
+	细类含义                string   `json:"细类含义"`
+	细类编码                string   `json:"细类（职业）"`
+	LLMOverview         string   `json:"LLM岗位概述"`
+	LLMResponsibilities []string `json:"LLM典型职责"`
+	LLMKeywords         []string `json:"LLM关联关键词"`
+	LLMTitles           []string `json:"LLM典型岗位"`
 }
 
 func (j JobClassification) Get职业名称() string {
@@ -322,24 +326,38 @@ func NewDataProcessor(embeddingService *EmbeddingService, chromaRepo *ChromaRepo
 
 func (p *DataProcessor) getEmbeddingText(job JobClassification) string {
 	var parts []string
-	parts = append(parts, fmt.Sprintf("大类: %s", job.大类))
-	if job.大类含义 != "" {
-		parts = append(parts, fmt.Sprintf("大类含义: %s", job.大类含义))
+	if job.LLMOverview != "" {
+		parts = append(parts, fmt.Sprintf("岗位概述: %s", job.LLMOverview))
 	}
-	parts = append(parts, fmt.Sprintf("中类: %s", job.中类))
-	if job.中类含义 != "" {
-		parts = append(parts, fmt.Sprintf("中类含义: %s", job.中类含义))
+	if len(job.LLMResponsibilities) > 0 {
+		parts = append(parts, fmt.Sprintf("典型职责: %s", strings.Join(job.LLMResponsibilities, "；")))
 	}
-	parts = append(parts, fmt.Sprintf("小类: %s", job.小类))
-	if job.小类含义 != "" {
-		parts = append(parts, fmt.Sprintf("小类含义: %s", job.小类含义))
+	if len(job.LLMKeywords) > 0 {
+		parts = append(parts, fmt.Sprintf("关联关键词: %s", strings.Join(job.LLMKeywords, "、")))
 	}
-	parts = append(parts, fmt.Sprintf("职业: %s", job.细类编码))
-	if job.细类含义 != "" {
-		parts = append(parts, fmt.Sprintf("职业含义: %s", job.细类含义))
+	if len(job.LLMTitles) > 0 {
+		parts = append(parts, fmt.Sprintf("典型岗位: %s", strings.Join(job.LLMTitles, "、")))
 	}
-	if job.细类主要工作任务 != "" {
-		parts = append(parts, fmt.Sprintf("工作任务: %s", job.细类主要工作任务))
+	if len(parts) == 0 {
+		parts = append(parts, fmt.Sprintf("大类: %s", job.大类))
+		if job.大类含义 != "" {
+			parts = append(parts, fmt.Sprintf("大类含义: %s", job.大类含义))
+		}
+		parts = append(parts, fmt.Sprintf("中类: %s", job.中类))
+		if job.中类含义 != "" {
+			parts = append(parts, fmt.Sprintf("中类含义: %s", job.中类含义))
+		}
+		parts = append(parts, fmt.Sprintf("小类: %s", job.小类))
+		if job.小类含义 != "" {
+			parts = append(parts, fmt.Sprintf("小类含义: %s", job.小类含义))
+		}
+		parts = append(parts, fmt.Sprintf("职业: %s", job.细类编码))
+		if job.细类含义 != "" {
+			parts = append(parts, fmt.Sprintf("职业含义: %s", job.细类含义))
+		}
+		if job.细类主要工作任务 != "" {
+			parts = append(parts, fmt.Sprintf("工作任务: %s", job.细类主要工作任务))
+		}
 	}
 	return strings.Join(parts, "\n")
 }
@@ -349,7 +367,18 @@ func generateUUID() string {
 }
 
 func cleanString(s string) string {
-	return strings.ReplaceAll(s, "**", "")
+	s = strings.ReplaceAll(s, "**", "")
+	return strings.TrimSpace(s)
+}
+
+func cleanStringSlice(values []string) []string {
+	var cleaned []string
+	for _, v := range values {
+		if trimmed := cleanString(v); trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	return cleaned
 }
 
 func cleanJobClassification(job *JobClassification) {
@@ -364,6 +393,67 @@ func cleanJobClassification(job *JobClassification) {
 	job.细类包含工种 = cleanString(job.细类包含工种)
 	job.细类含义 = cleanString(job.细类含义)
 	job.细类编码 = cleanString(job.细类编码)
+	job.LLMOverview = cleanString(job.LLMOverview)
+	job.LLMResponsibilities = cleanStringSlice(job.LLMResponsibilities)
+	job.LLMKeywords = cleanStringSlice(job.LLMKeywords)
+	job.LLMTitles = cleanStringSlice(job.LLMTitles)
+}
+
+func toStringSlice(value interface{}) []string {
+	switch v := value.(type) {
+	case []string:
+		return cleanStringSlice(v)
+	case []interface{}:
+		var buf []string
+		for _, item := range v {
+			if item == nil {
+				continue
+			}
+			buf = append(buf, fmt.Sprint(item))
+		}
+		return cleanStringSlice(buf)
+	case string:
+		return cleanStringSlice(parseStringField(v))
+	case nil:
+		return nil
+	default:
+		s := fmt.Sprint(v)
+		return cleanStringSlice(parseStringField(s))
+	}
+}
+
+func parseStringField(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		var arr []string
+		if err := json.Unmarshal([]byte(s), &arr); err == nil {
+			return arr
+		}
+	}
+	seps := func(r rune) bool {
+		switch r {
+		case '；', ';', '，', ',', '\n', '\r':
+			return true
+		default:
+			return false
+		}
+	}
+	parts := strings.FieldsFunc(s, seps)
+	if len(parts) > 1 {
+		return parts
+	}
+	return []string{s}
+}
+
+func joinSlice(values []string, sep string) string {
+	cleaned := cleanStringSlice(values)
+	if len(cleaned) == 0 {
+		return ""
+	}
+	return strings.Join(cleaned, sep)
 }
 
 func (p *DataProcessor) ProcessFile(ctx context.Context, filename string) error {
@@ -417,7 +507,16 @@ func (p *DataProcessor) ProcessFile(ctx context.Context, filename string) error 
 		if v, ok := rawJob["细类（职业）"].(string); ok {
 			job.细类编码 = cleanString(v)
 		}
+		if overview, ok := rawJob["LLM岗位概述"]; ok && overview != nil {
+			if str := cleanString(fmt.Sprint(overview)); str != "" {
+				job.LLMOverview = str
+			}
+		}
+		job.LLMResponsibilities = toStringSlice(rawJob["LLM典型职责"])
+		job.LLMKeywords = toStringSlice(rawJob["LLM关联关键词"])
+		job.LLMTitles = toStringSlice(rawJob["LLM典型岗位"])
 
+		cleanJobClassification(&job)
 		jobs = append(jobs, job)
 	}
 
@@ -450,16 +549,29 @@ func (p *DataProcessor) ProcessFile(ctx context.Context, filename string) error 
 		}
 
 		metadata := map[string]interface{}{
-			"大类":     job.大类,
-			"大类含义":   job.大类含义,
-			"中类":     job.中类,
-			"中类含义":   job.中类含义,
-			"小类":     job.小类,
-			"小类含义":   job.小类含义,
-			"细类职业":   job.细类编码,
-			"细类含义":   job.细类含义,
-			"细类包含工种": job.细类包含工种,
-			"源行号":    job.源行号,
+			"大类":       job.大类,
+			"大类含义":     job.大类含义,
+			"中类":       job.中类,
+			"中类含义":     job.中类含义,
+			"小类":       job.小类,
+			"小类含义":     job.小类含义,
+			"细类职业":     job.细类编码,
+			"细类含义":     job.细类含义,
+			"细类包含工种":   job.细类包含工种,
+			"细类主要工作任务": job.细类主要工作任务,
+			"源行号":      job.源行号,
+		}
+		if job.LLMOverview != "" {
+			metadata["LLM岗位概述"] = job.LLMOverview
+		}
+		if responsibilities := joinSlice(job.LLMResponsibilities, "；"); responsibilities != "" {
+			metadata["LLM典型职责"] = responsibilities
+		}
+		if keywords := joinSlice(job.LLMKeywords, "、"); keywords != "" {
+			metadata["LLM关联关键词"] = keywords
+		}
+		if titles := joinSlice(job.LLMTitles, "、"); titles != "" {
+			metadata["LLM典型岗位"] = titles
 		}
 
 		id := generateUUID()
@@ -533,6 +645,19 @@ func main() {
 	processor := NewDataProcessor(embeddingService, chromaRepo)
 
 	filename := "data/classification.json"
+	if _, err := os.Stat(filename); err != nil {
+		if os.IsNotExist(err) {
+			alt := "classification.json"
+			if _, altErr := os.Stat(alt); altErr == nil {
+				log.Printf("默认文件 %s 不存在，自动使用 %s", filename, alt)
+				filename = alt
+			} else {
+				log.Fatalf("Failed to locate classification file: %v", err)
+			}
+		} else {
+			log.Fatalf("Failed to access classification file: %v", err)
+		}
+	}
 	if err := processor.ProcessFile(ctx, filename); err != nil {
 		log.Fatalf("Failed to process file: %v", err)
 	}
