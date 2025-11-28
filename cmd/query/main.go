@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -25,7 +28,9 @@ const (
 	chromaDBURL         = "http://localhost:8000"
 	collectionName      = "job_classification"
 	databasePath        = "data/jobs.db"
+	graphDatabasePath   = "data/job_graph.db"
 	similarityThreshold = 0.55
+	graphNeighborLimit  = 5
 )
 
 type JobRecord struct {
@@ -35,6 +40,13 @@ type JobRecord struct {
 	Source     string
 	Status     string
 	Category   string
+}
+
+type jobRow struct {
+	rowID int64
+	mid   string
+	intro string
+	src   string
 }
 
 func (j JobRecord) StructuredJSON() string {
@@ -117,6 +129,91 @@ func (s *DatabaseService) Close() error {
 	return s.db.Close()
 }
 
+func (s *DatabaseService) NormalizeJobIDs(ctx context.Context) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT rowid, mid, job_intro, source FROM jobs`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	used := make(map[string]struct{})
+	var invalid []jobRow
+
+	for rows.Next() {
+		var r jobRow
+		if err := rows.Scan(&r.rowID, &r.mid, &r.intro, &r.src); err != nil {
+			return 0, err
+		}
+		clean := strings.TrimSpace(r.mid)
+		if isValidJobID(clean) {
+			used[clean] = struct{}{}
+			continue
+		}
+		r.mid = clean
+		invalid = append(invalid, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if len(invalid) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	stmt, err := tx.PrepareContext(ctx, `UPDATE jobs SET mid = ? WHERE rowid = ?`)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	defer stmt.Close()
+
+	for _, row := range invalid {
+		newID := generateJobID(row, used)
+		if _, err := stmt.ExecContext(ctx, newID, row.rowID); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(invalid), nil
+}
+
+func isValidJobID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, ch := range id {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func generateJobID(row jobRow, used map[string]struct{}) string {
+	base := fmt.Sprintf("%d|%s|%s|%s", row.rowID, row.mid, row.intro, row.src)
+	for salt := 0; ; salt++ {
+		data := base
+		if salt > 0 {
+			data = fmt.Sprintf("%s|%d", base, salt)
+		}
+		sum := sha256.Sum256([]byte(data))
+		candidate := hex.EncodeToString(sum[:16])
+		if _, exists := used[candidate]; exists {
+			continue
+		}
+		used[candidate] = struct{}{}
+		return candidate
+	}
+}
+
 func (s *DatabaseService) GetAllJobs() ([]JobRecord, error) {
 	query := `
 		SELECT mid, job_intro, structured_json, source, status, category
@@ -138,6 +235,7 @@ func (s *DatabaseService) GetAllJobs() ([]JobRecord, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
+		job.MID = strings.TrimSpace(job.MID)
 		jobs = append(jobs, job)
 	}
 
@@ -146,6 +244,62 @@ func (s *DatabaseService) GetAllJobs() ([]JobRecord, error) {
 	}
 
 	return jobs, nil
+}
+
+type GraphRepository struct {
+	db *sql.DB
+}
+
+type graphNeighbor struct {
+	ID    string
+	Score float64
+}
+
+func NewGraphRepository(dbPath string) (*GraphRepository, error) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open graph database: %w", err)
+	}
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect graph database: %w", err)
+	}
+	log.Printf("Successfully connected to graph database: %s", dbPath)
+	return &GraphRepository{db: db}, nil
+}
+
+func (r *GraphRepository) Close() error {
+	if r == nil || r.db == nil {
+		return nil
+	}
+	return r.db.Close()
+}
+
+func (r *GraphRepository) GetNeighbors(jobID string, limit int) ([]graphNeighbor, error) {
+	rows, err := r.db.Query(`
+		SELECT neighbor_id, score
+		FROM job_neighbors
+		WHERE job_id = ?
+		ORDER BY score DESC
+		LIMIT ?
+	`, jobID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var neighbors []graphNeighbor
+	for rows.Next() {
+		var n graphNeighbor
+		if err := rows.Scan(&n.ID, &n.Score); err != nil {
+			return nil, err
+		}
+		neighbors = append(neighbors, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return neighbors, nil
 }
 
 type ChromaRepository struct {
@@ -334,7 +488,7 @@ func NewCSVWriter() (*CSVWriter, error) {
 
 func (w *CSVWriter) WriteRow(job JobRecord, similarity float64, metadata map[string]interface{}) error {
 	row := []string{
-		job.MID,
+		cleanCell(job.MID),
 		truncate(job.JobIntro, 500),
 		fmt.Sprintf("%.4f", similarity),
 		safeString(metadata, "大类"),
@@ -365,27 +519,20 @@ func (w *CSVWriter) Close() error {
 }
 
 func truncate(s string, maxLen int) string {
-	// 清理换行符和回车符，替换为空格
+	s = cleanCell(s)
+	runes := []rune(s)
+	if len(runes) <= maxLen {
+		return s
+	}
+	return string(runes[:maxLen]) + "..."
+}
+
+func cleanCell(s string) string {
 	s = strings.ReplaceAll(s, "\r\n", " ")
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.ReplaceAll(s, "\r", " ")
-
-	// 清理制表符，替换为空格
 	s = strings.ReplaceAll(s, "\t", " ")
-
-	// 清理多余的连续空格
-	for strings.Contains(s, "  ") {
-		s = strings.ReplaceAll(s, "  ", " ")
-	}
-
-	// 去除开头和结尾的空白
-	s = strings.TrimSpace(s)
-
-	// 如果清理后的字符串仍然超过最大长度，则截断
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
+	return strings.TrimSpace(s)
 }
 
 func safeString(metadata map[string]interface{}, key string) string {
@@ -498,6 +645,7 @@ type QueryProcessor struct {
 	dbService    *DatabaseService
 	embeddingSvc *EmbeddingService
 	chromaRepo   *ChromaRepository
+	graphRepo    *GraphRepository
 	csvWriter    *CSVWriter
 }
 
@@ -509,10 +657,78 @@ type jobResult struct {
 	err        error
 }
 
+type classificationMatch struct {
+	Metadata   map[string]interface{}
+	Similarity float64
+}
+
+func buildMatchIndex(resp *ChromaQueryResponse) map[string]classificationMatch {
+	index := make(map[string]classificationMatch)
+	if resp == nil || len(resp.Metadatas) == 0 || len(resp.Distances) == 0 {
+		return index
+	}
+	metaList := resp.Metadatas[0]
+	distList := resp.Distances[0]
+	for i := 0; i < len(metaList) && i < len(distList); i++ {
+		meta := metaList[i]
+		jobID := safeString(meta, "细类职业")
+		if jobID == "" {
+			continue
+		}
+		similarity := cosineDistanceToScore(distList[i])
+		index[jobID] = classificationMatch{
+			Metadata:   meta,
+			Similarity: similarity,
+		}
+	}
+	return index
+}
+
+func (p *QueryProcessor) applyGraphCorrection(bestJobID string, currentMeta map[string]interface{}, currentSimilarity float64, matches map[string]classificationMatch) (map[string]interface{}, float64, bool) {
+	if p.graphRepo == nil || bestJobID == "" || len(matches) == 0 {
+		return currentMeta, currentSimilarity, false
+	}
+	neighbors, err := p.graphRepo.GetNeighbors(bestJobID, graphNeighborLimit)
+	if err != nil {
+		log.Printf("Warning: failed to read graph neighbors for %s: %v", bestJobID, err)
+		return currentMeta, currentSimilarity, false
+	}
+	if len(neighbors) == 0 {
+		return currentMeta, currentSimilarity, false
+	}
+	bestMeta := currentMeta
+	bestSimilarity := currentSimilarity
+	bestID := bestJobID
+	changed := false
+	for _, neighbor := range neighbors {
+		match, ok := matches[neighbor.ID]
+		if !ok {
+			continue
+		}
+		if match.Similarity > bestSimilarity {
+			bestSimilarity = match.Similarity
+			bestMeta = match.Metadata
+			bestID = neighbor.ID
+			changed = true
+		}
+	}
+	if changed {
+		log.Printf("Graph correction applied: %s -> %s (%.4f -> %.4f)", bestJobID, bestID, currentSimilarity, bestSimilarity)
+	}
+	return bestMeta, bestSimilarity, changed
+}
+
 func NewQueryProcessor(ctx context.Context, dbPath string) (*QueryProcessor, error) {
 	dbService, err := NewDatabaseService(dbPath)
 	if err != nil {
 		return nil, err
+	}
+
+	if fixed, err := dbService.NormalizeJobIDs(ctx); err != nil {
+		dbService.Close()
+		return nil, fmt.Errorf("failed to normalize job IDs: %w", err)
+	} else if fixed > 0 {
+		log.Printf("Normalized %d invalid job IDs", fixed)
 	}
 
 	csvWriter, err := NewCSVWriter()
@@ -528,16 +744,27 @@ func NewQueryProcessor(ctx context.Context, dbPath string) (*QueryProcessor, err
 		return nil, err
 	}
 
+	graphRepo, err := NewGraphRepository(graphDatabasePath)
+	if err != nil {
+		csvWriter.Close()
+		dbService.Close()
+		return nil, err
+	}
+
 	return &QueryProcessor{
 		dbService:    dbService,
 		embeddingSvc: NewEmbeddingService(),
 		chromaRepo:   chromaRepo,
+		graphRepo:    graphRepo,
 		csvWriter:    csvWriter,
 	}, nil
 }
 
 func (p *QueryProcessor) Close() {
 	p.dbService.Close()
+	if p.graphRepo != nil {
+		p.graphRepo.Close()
+	}
 	p.csvWriter.Close()
 }
 
@@ -656,6 +883,8 @@ func (p *QueryProcessor) processSingleJob(ctx context.Context, job JobRecord) jo
 		return jobResult{job: job}
 	}
 
+	matchIndex := buildMatchIndex(queryResp)
+
 	bestSimilarity := 0.0
 	bestDistance := 0.0
 	bestIndex := 0
@@ -683,6 +912,14 @@ func (p *QueryProcessor) processSingleJob(ctx context.Context, job JobRecord) jo
 		metadata = queryResp.Metadatas[0][bestIndex]
 	}
 
+	if metadata != nil {
+		bestJobID := safeString(metadata, "细类职业")
+		if updatedMeta, updatedSim, changed := p.applyGraphCorrection(bestJobID, metadata, bestSimilarity, matchIndex); changed {
+			metadata = updatedMeta
+			bestSimilarity = updatedSim
+		}
+	}
+
 	return jobResult{
 		job:        job,
 		similarity: bestSimilarity,
@@ -692,10 +929,13 @@ func (p *QueryProcessor) processSingleJob(ctx context.Context, job JobRecord) jo
 }
 
 func previewIntro(intro string) string {
-	if len(intro) > 80 {
-		return intro[:80] + "..."
+	intro = strings.TrimSpace(intro)
+	const limit = 80
+	if utf8.RuneCountInString(intro) <= limit {
+		return intro
 	}
-	return intro
+	runes := []rune(intro)
+	return string(runes[:limit]) + "..."
 }
 
 func main() {
