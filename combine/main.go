@@ -55,6 +55,8 @@ type options struct {
     queryWorkers int   // 查询阶段的并发（默认与 cmd/query 的 10 一致）
     trace       bool   // 逐条记录阶段日志
     limitJobs   int    // 仅处理前 N 条（用于联调验证准确性）
+    clean       bool   // 强制清空已存在的输出目录后重跑（默认增量续跑）
+    minSim      float64 // 最低相似度阈值（仅用于日志提示；匹配始终取最优1条）
 }
 
 func parseFlags() options {
@@ -67,6 +69,8 @@ func parseFlags() options {
     flag.IntVar(&opts.queryWorkers, "query-workers", 10, "每个CSV在查询阶段的并发数")
     flag.BoolVar(&opts.trace, "trace", false, "开启逐条记录阶段日志（用于准确性排查）")
     flag.IntVar(&opts.limitJobs, "limit-jobs", 0, "仅处理前 N 条岗位（0 表示全部）")
+    flag.BoolVar(&opts.clean, "clean", false, "存在输出目录时先清空再重跑（默认增量续跑）")
+    flag.Float64Var(&opts.minSim, "min-sim", 0.0, "最低相似度阈值（仅日志提示，不拒绝落表；默认0.0）")
     flag.Parse()
     if opts.fileWorkers < 1 { opts.fileWorkers = 1 }
     if opts.batchSize < 1 { opts.batchSize = 1 }
@@ -82,41 +86,85 @@ type importStats struct {
 }
 
 type csvRow struct {
-    MID  string
-    Intro string
+    MID      string
+    Intro    string
+    Filtered bool // true: intro 长度 < 6，需要忽略匹配
 }
 
-func scanCSV(filePath string) (header []string, rows []csvRow, stats importStats, err error) {
-    f, err := os.Open(filePath)
-    if err != nil { return nil, nil, stats, err }
+// 流式读取 CSV：一边写 ignore.csv，一边按 batch 写入 DB，避免大文件占用大量内存
+func streamCSVToDB(ctx context.Context, csvPath string, ignorePath string, db *sql.DB, source string, batchSize int, trace bool) (stats importStats, err error) {
+    f, err := os.Open(csvPath)
+    if err != nil { return stats, err }
     defer f.Close()
     r := csv.NewReader(bufio.NewReader(f))
     r.ReuseRecord = true
     r.LazyQuotes = true
     r.FieldsPerRecord = -1
 
-    recs, err := r.ReadAll()
-    if err != nil { return nil, nil, stats, err }
-    if len(recs) == 0 { return nil, nil, stats, nil }
-    header = recs[0]
-    for i := 1; i < len(recs); i++ {
-        rec := recs[i]
-        stats.Total++
-        if len(rec) < 2 { // 不完整行计入过滤
-            stats.Filtered++
+    // 打开 ignore.csv
+    igf, err := os.Create(ignorePath)
+    if err != nil { return stats, err }
+    defer func(){ _ = igf.Close() }()
+    igw := csv.NewWriter(igf)
+    if err := igw.Write([]string{"mid", "job_intro"}); err != nil { return stats, err }
+
+    // 先读表头
+    header, err := r.Read()
+    if err == io.EOF { igw.Flush(); return stats, igw.Error() }
+    if err != nil { return stats, err }
+    if len(header) < 2 {
+        // 不规范表头也继续读取数据
+    }
+
+    // 累计一个小批次写 DB，避免持久占用内存
+    batch := make([]csvRow, 0, batchSize)
+    flushBatch := func() error {
+        if len(batch) == 0 { return nil }
+        if err := importRowsToDB(ctx, db, batch, source, batchSize, trace); err != nil { return err }
+        batch = batch[:0]
+        return nil
+    }
+
+    for {
+        rec, err := r.Read()
+        if err == io.EOF { break }
+        if err != nil { return stats, err }
+        // 对于不规范行：字段不足，既不入库也不写入 ignore，避免造成空行
+        if len(rec) < 2 {
+            if trace { log.Printf("[SKIP] malformed row: fields<2") }
             continue
         }
         mid := strings.TrimSpace(rec[0])
         intro := strings.TrimSpace(rec[1])
-        if introRuneLen(intro) < 5 { // 过滤
+        if mid == "" {
+            if trace { log.Printf("[SKIP] empty mid row, intro_len=%d", introRuneLen(intro)) }
+            continue
+        }
+        stats.Total++
+        if introRuneLen(intro) < 6 {
             stats.Filtered++
-            rows = append(rows, csvRow{MID: mid, Intro: intro}) // 仍返回，用于写 ignore.csv
+            _ = igw.Write([]string{mid, intro})
+            if trace {
+                // 行号无法直接取得，这里打印 mid 与长度
+                log.Printf("[FILTER] mid=%s intro_len=%d(<6)", mid, introRuneLen(intro))
+            }
+            // 仍然写入 DB，但打上过滤标记，保证最终计数对齐（result+ignore==db）
+            if mid != "" { batch = append(batch, csvRow{MID: mid, Intro: intro, Filtered: true}) }
+            if len(batch) >= batchSize {
+                if err := flushBatch(); err != nil { return stats, err }
+            }
             continue
         }
         stats.Imported++
-        rows = append(rows, csvRow{MID: mid, Intro: intro})
+        batch = append(batch, csvRow{MID: mid, Intro: intro, Filtered: false})
+        if len(batch) >= batchSize {
+            if err := flushBatch(); err != nil { return stats, err }
+        }
     }
-    return header, rows, stats, nil
+    if err := flushBatch(); err != nil { return stats, err }
+    igw.Flush()
+    if err := igw.Error(); err != nil { return stats, err }
+    return stats, nil
 }
 
 func introRuneLen(s string) int { return len([]rune(strings.TrimSpace(s))) }
@@ -163,19 +211,43 @@ func importRowsToDB(ctx context.Context, db *sql.DB, rows []csvRow, source strin
         if end > len(rows) { end = len(rows) }
         tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelDefault})
         if err != nil { return err }
-        stmt, err := tx.PrepareContext(ctx, `INSERT OR REPLACE INTO jobs(mid, job_intro, source, status, category, updated_at) VALUES (?, ?, ?, '待处理', '', ?)`)
+        // 两类 UPSERT：正常数据（保留旧 status）、过滤数据（强制标记为 '过滤'）
+        stmtNorm, err := tx.PrepareContext(ctx, `INSERT INTO jobs(mid, job_intro, source, status, category, updated_at)
+            VALUES (?, ?, ?, COALESCE((SELECT status FROM jobs WHERE mid = ?), '待处理'), COALESCE((SELECT category FROM jobs WHERE mid = ?), ''), ?)
+            ON CONFLICT(mid) DO UPDATE SET
+                job_intro=excluded.job_intro,
+                source=excluded.source,
+                updated_at=excluded.updated_at`)
         if err != nil { tx.Rollback(); return err }
+        stmtFilt, err := tx.PrepareContext(ctx, `INSERT INTO jobs(mid, job_intro, source, status, category, updated_at)
+            VALUES (?, ?, ?, '过滤', COALESCE((SELECT category FROM jobs WHERE mid = ?), ''), ?)
+            ON CONFLICT(mid) DO UPDATE SET
+                job_intro=excluded.job_intro,
+                source=excluded.source,
+                status='过滤',
+                updated_at=excluded.updated_at`)
+        if err != nil { stmtNorm.Close(); tx.Rollback(); return err }
+
         for idx, r := range rows[i:end] {
-            // 跳过 intro < 5 的行（此前已剔除），这里仍容错
-            if introRuneLen(r.Intro) < 5 { continue }
-            if _, err := stmt.ExecContext(ctx, strings.TrimSpace(r.MID), r.Intro, source, now); err != nil {
-                stmt.Close(); tx.Rollback(); return err
+            mid := strings.TrimSpace(r.MID)
+            if mid == "" { continue }
+            if r.Filtered {
+                if _, err := stmtFilt.ExecContext(ctx, mid, r.Intro, source, mid, now); err != nil {
+                    stmtFilt.Close(); stmtNorm.Close(); tx.Rollback(); return err
+                }
+            } else {
+                if _, err := stmtNorm.ExecContext(ctx, mid, r.Intro, source, mid, mid, now); err != nil {
+                    stmtFilt.Close(); stmtNorm.Close(); tx.Rollback(); return err
+                }
             }
             if trace {
-                log.Printf("[DB-INSERT] mid=%s batch=%d item=%d", strings.TrimSpace(r.MID), i/batchSize+1, idx+1)
+                tag := "norm"
+                if r.Filtered { tag = "filt" }
+                log.Printf("[DB-INSERT] mid=%s batch=%d item=%d kind=%s", mid, i/batchSize+1, idx+1, tag)
             }
         }
-        stmt.Close()
+        stmtFilt.Close()
+        stmtNorm.Close()
         if err := tx.Commit(); err != nil { return err }
     }
     return nil
@@ -254,18 +326,20 @@ func generateJobID(row jobRow, used map[string]struct{}) string {
     }
 }
 
-func (s *DatabaseService) GetAllJobs() ([]JobRecord, error) {
-    rows, err := s.db.Query(`SELECT mid, job_intro, structured_json, source, status, category FROM jobs WHERE job_intro IS NOT NULL AND job_intro != '' ORDER BY mid`)
-    if err != nil { return nil, err }
-    defer rows.Close()
-    var jobs []JobRecord
-    for rows.Next() {
-        var j JobRecord
-        if err := rows.Scan(&j.MID, &j.JobIntro, &j.Structured, &j.Source, &j.Status, &j.Category); err != nil { return nil, err }
-        j.MID = strings.TrimSpace(j.MID)
-        jobs = append(jobs, j)
-    }
-    return jobs, rows.Err()
+func (s *DatabaseService) CountJobs(ctx context.Context) (int, error) {
+    row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM jobs WHERE job_intro IS NOT NULL AND job_intro != ''`)
+    var n int
+    if err := row.Scan(&n); err != nil { return 0, err }
+    return n, nil
+}
+
+func (s *DatabaseService) StreamJobs(ctx context.Context) (*sql.Rows, error) {
+    // 只流式返回“未处理完成且未被过滤”的岗位，用于续跑
+    return s.db.QueryContext(ctx, `SELECT mid, job_intro, structured_json, source, status, category
+        FROM jobs
+        WHERE job_intro IS NOT NULL AND job_intro != ''
+          AND status!='处理完成' AND status!='过滤'
+        ORDER BY mid`)
 }
 
 // Embedding
@@ -356,14 +430,47 @@ func (r *ChromaRepository) Query(ctx context.Context, embedding []float32) (*Chr
 
 // CSV 写入（对单文件结果加锁，避免并发问题）
 type CSVWriter struct { mu sync.Mutex; file *os.File; w *csv.Writer }
-func NewCSVWriterTo(path string) (*CSVWriter, error) {
+func NewCSVWriterTo(path string, appendMode bool) (*CSVWriter, error) {
     if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return nil, err }
-    f, err := os.Create(path)
+    var f *os.File
+    info, err := os.Stat(path)
+    if appendMode && err == nil && !info.IsDir() {
+        f, err = os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+        if err != nil { return nil, err }
+        w := csv.NewWriter(f)
+        return &CSVWriter{file: f, w: w}, nil
+    }
+    // 新建并写表头
+    f, err = os.Create(path)
     if err != nil { return nil, err }
     w := csv.NewWriter(f)
     headers := []string{"job_id","job_intro","similarity_score","大类","大类含义","中类","中类含义","小类","小类含义","细类职业","细类含义","细类主要工作任务"}
     if err := w.Write(headers); err != nil { f.Close(); return nil, err }
     return &CSVWriter{file: f, w: w}, nil
+}
+
+// 读取可选的人工/上次会话基线（用于精确续跑进度的对齐）。
+// 若存在 output/<base>/.resume_base 文件，取其整数值作为建议基线；仅用于显示，不影响处理逻辑。
+func readResumeBase(resultPath string) int {
+    dir := filepath.Dir(resultPath)
+    resumeFile := filepath.Join(dir, ".resume_base")
+    data, err := os.ReadFile(resumeFile)
+    if err != nil { return 0 }
+    s := strings.TrimSpace(string(data))
+    if s == "" { return 0 }
+    var n int
+    _, err = fmt.Sscanf(s, "%d", &n)
+    if err != nil || n < 0 { return 0 }
+    return n
+}
+
+// 原子写入断点进度到 output/<base>/.resume_base
+func writeResumeBase(resultPath string, val int) {
+    dir := filepath.Dir(resultPath)
+    tmp := filepath.Join(dir, ".resume_base.tmp")
+    dst := filepath.Join(dir, ".resume_base")
+    _ = os.WriteFile(tmp, []byte(fmt.Sprintf("%d\n", val)), 0o644)
+    _ = os.Rename(tmp, dst)
 }
 func (c *CSVWriter) WriteRow(job JobRecord, similarity float64, meta map[string]interface{}) error {
     row := []string{
@@ -429,6 +536,10 @@ type QueryProcessor struct {
     workerCount  int
     trace        bool
     limitJobs    int
+    processedSet map[string]struct{}
+    baseProcessed int
+    totalAll      int
+    minSim        float64
 }
 type jobResult struct { job JobRecord; similarity float64; metadata map[string]interface{}; matched bool; err error }
 type classificationMatch struct { Metadata map[string]interface{}; Similarity float64 }
@@ -460,28 +571,61 @@ func (p *QueryProcessor) applyGraphCorrection(bestJobID string, currentMeta map[
     return bestMeta, bestSim, changed
 }
 
-func NewQueryProcessor(ctx context.Context, dbPath, resultPath, graphDBPath string, workerCount int, trace bool, limit int) (*QueryProcessor, error) {
+func NewQueryProcessor(ctx context.Context, dbPath, resultPath, graphDBPath string, workerCount int, trace bool, limit int, appendMode bool, processed map[string]struct{}, minSim float64) (*QueryProcessor, error) {
     dbService, err := NewDatabaseService(dbPath)
     if err != nil { return nil, err }
     if fixed, err := dbService.NormalizeJobIDs(ctx); err != nil { dbService.Close(); return nil, fmt.Errorf("failed to normalize job IDs: %w", err) } else if fixed > 0 { log.Printf("Normalized %d invalid job IDs", fixed) }
-    csvWriter, err := NewCSVWriterTo(resultPath)
+    csvWriter, err := NewCSVWriterTo(resultPath, appendMode)
     if err != nil { dbService.Close(); return nil, err }
     chromaRepo, err := NewChromaRepository(ctx)
     if err != nil { csvWriter.Close(); dbService.Close(); return nil, err }
     graphRepo, err := NewGraphRepository(graphDBPath)
     if err != nil { csvWriter.Close(); dbService.Close(); return nil, err }
-    return &QueryProcessor{dbService: dbService, embeddingSvc: NewEmbeddingService(), chromaRepo: chromaRepo, graphRepo: graphRepo, csvWriter: csvWriter, workerCount: workerCount, trace: trace, limitJobs: limit}, nil
+    // 计算进度基线：totalAll 与 baseProcessed（取 DB 打标、result.csv 与可选 resume_base 三者的最大值）
+    totalAll, err := dbService.CountJobs(ctx)
+    if err != nil { totalAll = 0 }
+    baseDB, err := dbService.CountProcessed(ctx)
+    if err != nil { baseDB = 0 }
+    baseCSV := len(processed)
+    // 可选 resume_base（用户可手动设置以对齐历史未记录的“已处理但未匹配”的数量）
+    baseHint := readResumeBase(resultPath)
+    if baseDB < baseCSV { baseDB = baseCSV }
+    if baseDB < baseHint { baseDB = baseHint }
+    if baseDB > totalAll { baseDB = totalAll }
+    if totalAll < 0 { totalAll = 0 }
+
+    qp := &QueryProcessor{
+        dbService:     dbService,
+        embeddingSvc:  NewEmbeddingService(),
+        chromaRepo:    chromaRepo,
+        graphRepo:     graphRepo,
+        csvWriter:     csvWriter,
+        workerCount:   workerCount,
+        trace:         trace,
+        limitJobs:     limit,
+        processedSet:  processed,
+        baseProcessed: baseDB,
+        totalAll:      totalAll,
+        minSim:        minSim,
+    }
+    remaining := totalAll - baseDB
+    if remaining < 0 { remaining = 0 }
+    log.Printf("History processed=%d/%d, remaining=%d", baseDB, totalAll, remaining)
+    return qp, nil
 }
 func (p *QueryProcessor) Close() { p.dbService.Close(); if p.graphRepo != nil { p.graphRepo.Close() }; p.csvWriter.Close() }
 
 func (p *QueryProcessor) Process(ctx context.Context) error {
-    jobs, err := p.dbService.GetAllJobs()
+    // 基于历史基线计算剩余任务并打印
+    remaining := p.totalAll - p.baseProcessed
+    if remaining < 0 { remaining = 0 }
+    if p.limitJobs > 0 && p.limitJobs < remaining { remaining = p.limitJobs }
+    log.Printf("Found %d jobs to process (history=%d/%d, remaining=%d)", remaining, p.baseProcessed, p.totalAll, remaining)
+
+    rows, err := p.dbService.StreamJobs(ctx)
     if err != nil { return err }
-    if p.limitJobs > 0 && p.limitJobs < len(jobs) {
-        jobs = jobs[:p.limitJobs]
-    }
-    total := len(jobs)
-    log.Printf("Found %d jobs to process", total)
+    defer rows.Close()
+
     jobsCh := make(chan JobRecord)
     resultsCh := make(chan jobResult)
     var wg sync.WaitGroup
@@ -492,12 +636,49 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
             for job := range jobsCh { resultsCh <- p.processSingleJob(ctx, job) }
         }()
     }
-    go func() { for _, j := range jobs { jobsCh <- j }; close(jobsCh); wg.Wait(); close(resultsCh) }()
-    processed, matched := 0, 0
+
+    // feeder：逐行从 DB 读取并投入 jobsCh，避免一次性加载到内存
+    go func() {
+        sent := 0
+        for rows.Next() {
+            var j JobRecord
+            if err := rows.Scan(&j.MID, &j.JobIntro, &j.Structured, &j.Source, &j.Status, &j.Category); err != nil {
+                log.Printf("Warning: scan job row failed: %v", err)
+                continue
+            }
+            j.MID = strings.TrimSpace(j.MID)
+            if p.processedSet != nil {
+                if _, ok := p.processedSet[j.MID]; ok {
+                    continue
+                }
+            }
+            jobsCh <- j
+            sent++
+            if p.limitJobs > 0 && sent >= p.limitJobs { break }
+        }
+        close(jobsCh)
+        wg.Wait()
+        close(resultsCh)
+    }()
+
+    processedSession, matched := 0, 0
     start := time.Now()
     for res := range resultsCh {
-        processed++
-        if processed == 1 || processed%50 == 0 { log.Printf("Progress: %d/%d (%.1f%%)", processed, total, float64(processed)/float64(total)*100) }
+        // 仅在无错误时，标记处理完成
+        if res.err == nil {
+            if err := p.dbService.MarkProcessed(ctx, res.job.MID); err != nil {
+                log.Printf("Warning: mark processed failed mid=%s: %v", res.job.MID, err)
+            }
+        }
+        processedSession++
+        if processedSession == 1 || processedSession%50 == 0 {
+            curr := p.baseProcessed + processedSession
+            pct := 0.0
+            if p.totalAll > 0 { pct = float64(curr) / float64(p.totalAll) * 100 }
+            log.Printf("Progress: %d/%d (%.1f%%)", curr, p.totalAll, pct)
+            // 持久化进度基线，确保断点续跑继续从该位置显示
+            writeResumeBase(p.csvWriter.file.Name(), curr)
+        }
         if res.err != nil { log.Println(res.err); continue }
         if res.matched {
             matched++
@@ -505,8 +686,10 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
             if matched%100 == 0 { if err := p.csvWriter.Flush(); err != nil { log.Printf("Warning: csv flush failed: %v", err) } else { log.Printf("Auto-saved CSV after %d matched records", matched) } }
         }
     }
-    log.Printf("Query completed! total=%d processed=%d matched(>=%.2f)=%d elapsed=%.2fs", total, processed, similarityThreshold, matched, time.Since(start).Seconds())
-    return nil
+    curr := p.baseProcessed + processedSession
+    log.Printf("Query completed! total=%d processed=%d matched(>=%.2f)=%d elapsed=%.2fs", p.totalAll, curr, p.minSim, matched, time.Since(start).Seconds())
+    writeResumeBase(p.csvWriter.file.Name(), curr)
+    return rows.Err()
 }
 
 func (p *QueryProcessor) processSingleJob(ctx context.Context, job JobRecord) jobResult {
@@ -535,8 +718,11 @@ func (p *QueryProcessor) processSingleJob(ctx context.Context, job JobRecord) jo
     // 取最优候选
     bestSim := 0.0; bestIdx := 0; bestDist := 0.0
     for j := 0; j < len(qresp.Distances[0]); j++ { d := qresp.Distances[0][j]; s := cosineDistanceToScore(d); if s > bestSim { bestSim, bestIdx, bestDist = s, j, d } }
-    if p.trace { log.Printf("[CHROMA-BEST] mid=%s similarity=%.4f threshold=%.2f", job.MID, bestSim, similarityThreshold) }
-    if bestSim < similarityThreshold { return jobResult{job: job} }
+    if p.trace { log.Printf("[CHROMA-BEST] mid=%s similarity=%.4f min-sim=%.2f", job.MID, bestSim, p.minSim) }
+    // 不以阈值拒绝落表：始终选择最优1条。若低于 min-sim，仅记录日志。
+    if bestSim < p.minSim && p.trace {
+        log.Printf("[LOWCONF] mid=%s similarity=%.4f < %.2f", job.MID, bestSim, p.minSim)
+    }
     var meta map[string]interface{}
     if len(qresp.Metadatas) > 0 && len(qresp.Metadatas[0]) > bestIdx { meta = qresp.Metadatas[0][bestIdx] }
     // 图纠偏（与 cmd/query 一致）
@@ -569,32 +755,63 @@ type fileTask struct {
     dbPath     string
 }
 
-func discoverCSV(inputPath string) ([]string, error) {
-    fi, err := os.Stat(inputPath)
-    if err != nil { return nil, err }
-    if fi.IsDir() {
-        var files []string
-        entries, err := os.ReadDir(inputPath)
-        if err != nil { return nil, err }
-        for _, e := range entries { if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".csv") { files = append(files, filepath.Join(inputPath, e.Name())) } }
-        sort.Strings(files)
-        return files, nil
-    }
-    // 单文件
-    if strings.HasSuffix(strings.ToLower(inputPath), ".csv") { return []string{inputPath}, nil }
-    return nil, fmt.Errorf("input is neither a directory nor a CSV file: %s", inputPath)
+func isGlobPattern(s string) bool {
+    return strings.ContainsAny(s, "*?[")
 }
 
-func buildTasks(csvFiles []string) ([]fileTask, error) {
+func discoverCSV(inputPath string) ([]string, error) {
+    // 1) 直接存在：目录或文件
+    if fi, err := os.Stat(inputPath); err == nil {
+        if fi.IsDir() {
+            var files []string
+            entries, err := os.ReadDir(inputPath)
+            if err != nil { return nil, err }
+            for _, e := range entries {
+                if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".csv") {
+                    files = append(files, filepath.Join(inputPath, e.Name()))
+                }
+            }
+            sort.Strings(files)
+            return files, nil
+        }
+        if strings.HasSuffix(strings.ToLower(inputPath), ".csv") {
+            return []string{inputPath}, nil
+        }
+        return nil, fmt.Errorf("input is neither a directory nor a CSV file: %s", inputPath)
+    }
+
+    // 2) 不存在：按通配符（glob）处理，例如 data/51job/51job_2024_*.csv 或 data/51job/*2024*.csv
+    if isGlobPattern(inputPath) {
+        matched, err := filepath.Glob(inputPath)
+        if err != nil { return nil, fmt.Errorf("invalid glob pattern: %w", err) }
+        if len(matched) == 0 { return nil, fmt.Errorf("glob matched no files: %s", inputPath) }
+        var files []string
+        for _, p := range matched {
+            if fi, err := os.Stat(p); err == nil && !fi.IsDir() && strings.HasSuffix(strings.ToLower(p), ".csv") {
+                files = append(files, p)
+            }
+        }
+        if len(files) == 0 { return nil, fmt.Errorf("glob produced no CSV files: %s", inputPath) }
+        sort.Strings(files)
+        log.Printf("[MATCH] glob=%s files=%d", inputPath, len(files))
+        return files, nil
+    }
+
+    return nil, fmt.Errorf("input path not found and not a glob: %s", inputPath)
+}
+
+func buildTasks(csvFiles []string, opts options) ([]fileTask, error) {
     var tasks []fileTask
     for _, p := range csvFiles {
         base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
         outDir := filepath.Join("output", base)
-        // 如果输出目录已存在，则清空后重建，确保“重新匹配和处理”
+        // 续跑：默认不清空；若 --clean 指定，则清空重建
         if fi, err := os.Stat(outDir); err == nil && fi.IsDir() {
-            log.Printf("[CLEAN] remove existing output folder: %s", outDir)
-            if err := os.RemoveAll(outDir); err != nil {
-                return nil, fmt.Errorf("failed to clean output folder %s: %w", outDir, err)
+            if opts.clean {
+                log.Printf("[CLEAN] remove existing output folder: %s", outDir)
+                if err := os.RemoveAll(outDir); err != nil {
+                    return nil, fmt.Errorf("failed to clean output folder %s: %w", outDir, err)
+                }
             }
         }
         if err := os.MkdirAll(outDir, 0o755); err != nil { return nil, err }
@@ -611,56 +828,134 @@ func buildTasks(csvFiles []string) ([]fileTask, error) {
     return tasks, nil
 }
 
-func writeIgnoreCSV(path string, header []string, rows []csvRow) error {
-    f, err := os.Create(path)
-    if err != nil { return err }
-    defer f.Close()
-    w := csv.NewWriter(f)
-    // 强制使用两列标题
-    if err := w.Write([]string{"mid", "job_intro"}); err != nil { return err }
-    for _, r := range rows { if introRuneLen(r.Intro) < 5 { if err := w.Write([]string{r.MID, r.Intro}); err != nil { return err } } }
-    w.Flush(); return w.Error()
-}
+// 已被 streamCSVToDB 取代（保留占位避免接口变动）
+func writeIgnoreCSV(path string, header []string, rows []csvRow) error { return nil }
 
 func writeCountTXT(path string, st importStats) error {
-    // 处理+过滤==原始
     ok := st.Imported+st.Filtered == st.Total
     content := fmt.Sprintf("total=%d\nprocessed=%d\nfiltered=%d\nok=%v\n", st.Total, st.Imported, st.Filtered, ok)
     return os.WriteFile(path, []byte(content), 0o644)
 }
 
+func countProcessedRows(path string) (int64, error) {
+    f, err := os.Open(path)
+    if err != nil {
+        if os.IsNotExist(err) { return 0, nil }
+        return 0, err
+    }
+    defer f.Close()
+    r := csv.NewReader(bufio.NewReader(f))
+    r.ReuseRecord = true
+    r.LazyQuotes = true
+    r.FieldsPerRecord = -1
+    // 读表头
+    if _, err := r.Read(); err != nil {
+        if err == io.EOF { return 0, nil }
+        return 0, err
+    }
+    var n int64
+    for {
+        if _, err := r.Read(); err != nil {
+            if err == io.EOF { break }
+            return n, err
+        }
+        n++
+    }
+    return n, nil
+}
+
+func loadProcessedSet(path string) (map[string]struct{}, int64, error) {
+    set := make(map[string]struct{})
+    f, err := os.Open(path)
+    if err != nil {
+        if os.IsNotExist(err) { return set, 0, nil }
+        return nil, 0, err
+    }
+    defer f.Close()
+    r := csv.NewReader(bufio.NewReader(f))
+    r.ReuseRecord = true
+    r.LazyQuotes = true
+    r.FieldsPerRecord = -1
+    header, err := r.Read()
+    if err != nil {
+        if err == io.EOF { return set, 0, nil }
+        return set, 0, err
+    }
+    // 定位 job_id 列
+    jobIdx := 0
+    for i, h := range header {
+        if strings.TrimSpace(h) == "job_id" { jobIdx = i; break }
+    }
+    var n int64
+    for {
+        rec, err := r.Read()
+        if err != nil {
+            if err == io.EOF { break }
+            return set, n, err
+        }
+        if jobIdx < len(rec) {
+            id := strings.TrimSpace(rec[jobIdx])
+            if id != "" { set[id] = struct{}{} }
+        }
+        n++
+    }
+    return set, n, nil
+}
+
+// 统计 CSV 的数据行数（含表头时减1）；不存在则返回0
+func countCSVRows(path string) (int64, error) { return countProcessedRows(path) }
+
+// 写 count.txt（严格校验）：
+// - total = result_rows + ignore_rows
+// - processed = result_rows
+// - filtered = ignore_rows
+// - ok = (processed == db_rows) && (processed + filtered == csv_total)
+func writeCountStrict(path string, total, processed, filtered, dbRows int64) error {
+    // 严格校验：result.csv 行数 + ignore.csv 行数 必须等于 DB 行数
+    ok := (processed+filtered == dbRows)
+    content := fmt.Sprintf("total=%d\nprocessed=%d\nfiltered=%d\nok=%v\n", total, processed, filtered, ok)
+    return os.WriteFile(path, []byte(content), 0o644)
+}
+
 func processSingleCSV(ctx context.Context, t fileTask, opts options) error {
     log.Printf("[START] %s -> %s", t.csvPath, t.outDir)
-    // 读取 & 过滤
-    header, allRows, stats, err := scanCSV(t.csvPath)
-    if err != nil { return fmt.Errorf("read csv failed: %w", err) }
-    // 拆分：过滤行 & 需导入行
-    var importRows []csvRow
-    for idx, r := range allRows {
-        if introRuneLen(r.Intro) >= 5 {
-            importRows = append(importRows, r)
-        } else if opts.trace {
-            log.Printf("[FILTER] line=%d mid=%s intro_len=%d(<5)", idx+2, r.MID, introRuneLen(r.Intro))
-        }
-    }
-    // ignore.csv
-    if err := writeIgnoreCSV(t.ignorePath, header, allRows); err != nil { return fmt.Errorf("write ignore.csv failed: %w", err) }
-    log.Printf("[IMPORT] total=%d to_import=%d filtered(<5)=%d", stats.Total, len(importRows), stats.Filtered)
-    // 建库 & 导入
+    // 建库
     db, err := ensureDB(t.dbPath)
     if err != nil { return fmt.Errorf("open sqlite failed: %w", err) }
-    if err := importRowsToDB(ctx, db, importRows, t.source, opts.batchSize, opts.trace); err != nil { db.Close(); return fmt.Errorf("import to sqlite failed: %w", err) }
+    // 流式读取 CSV -> ignore.csv + origin.db
+    stats, err := streamCSVToDB(ctx, t.csvPath, t.ignorePath, db, t.source, opts.batchSize, opts.trace)
+    if err != nil { db.Close(); return fmt.Errorf("stream import failed: %w", err) }
+    log.Printf("[IMPORT] total=%d to_import=%d filtered(<5)=%d", stats.Total, stats.Imported, stats.Filtered)
     db.Close()
-    // 查询
-    qp, err := NewQueryProcessor(ctx, t.dbPath, t.resultPath, "data/job_graph.db", opts.queryWorkers, opts.trace, opts.limitJobs)
+    // 查询（支持续跑）：若存在 result.csv，则从其中读取已处理 job_id 集合，并以追加方式写入
+    appendMode := false
+    processedSet := make(map[string]struct{})
+    if _, err := os.Stat(t.resultPath); err == nil {
+        appendMode = true
+        set, _, err := loadProcessedSet(t.resultPath)
+        if err != nil { return fmt.Errorf("load processed set failed: %w", err) }
+        processedSet = set
+        log.Printf("[RESUME] detected existing result.csv, processed=%d", len(processedSet))
+    }
+    qp, err := NewQueryProcessor(ctx, t.dbPath, t.resultPath, "data/job_graph.db", opts.queryWorkers, opts.trace, opts.limitJobs, appendMode, processedSet, opts.minSim)
     if err != nil { return fmt.Errorf("init query processor failed: %w", err) }
     if err := qp.Process(ctx); err != nil { qp.Close(); return fmt.Errorf("query process failed: %w", err) }
     qp.Close()
-    // 统计（写两份：data/<base>/count.txt 与 output/<base>/count.txt）
-    if err := writeCountTXT(t.countPath, stats); err != nil { return fmt.Errorf("write count.txt failed: %w", err) }
-    if err := writeCountTXT(t.countPath2, stats); err != nil { return fmt.Errorf("write count.txt (output) failed: %w", err) }
+    // 统计与一致性校验：result.csv + ignore.csv 必须覆盖全部数据，且 result.csv 行数与 DB 行数一致
+    resultRows, err := countCSVRows(t.resultPath)
+    if err != nil { return fmt.Errorf("count result.csv failed: %w", err) }
+    ignoreRows, err := countCSVRows(t.ignorePath)
+    if err != nil { return fmt.Errorf("count ignore.csv failed: %w", err) }
+    totalRows := resultRows + ignoreRows
+    // DB 行数（已导入的岗位数）
+    dbSvc, err := NewDatabaseService(t.dbPath)
+    if err != nil { return fmt.Errorf("open db for count failed: %w", err) }
+    dbCount, err := dbSvc.CountJobs(ctx)
+    _ = dbSvc.Close()
+    if err != nil { return fmt.Errorf("db count failed: %w", err) }
+    if err := writeCountStrict(t.countPath, totalRows, resultRows, ignoreRows, int64(dbCount)); err != nil { return fmt.Errorf("write count.txt failed: %w", err) }
+    if err := writeCountStrict(t.countPath2, totalRows, resultRows, ignoreRows, int64(dbCount)); err != nil { return fmt.Errorf("write count.txt (output) failed: %w", err) }
     log.Printf("[DONE] %s -> result=%s origin.db=%s count=%s,%s", t.baseName, t.resultPath, t.dbPath, t.countPath, t.countPath2)
-    _ = header // 保留变量以防将来扩展
     return nil
 }
 
@@ -671,7 +966,7 @@ func main() {
     files, err := discoverCSV(opts.inputPath)
     if err != nil { log.Fatalf("discover csv failed: %v", err) }
     if len(files) == 0 { log.Println("no csv files found, exit"); return }
-    tasks, err := buildTasks(files)
+    tasks, err := buildTasks(files, opts)
     if err != nil { log.Fatalf("build tasks failed: %v", err) }
     log.Printf("发现 %d 个 CSV，将并发处理（file-workers=%d）", len(tasks), opts.fileWorkers)
 
@@ -697,4 +992,15 @@ func main() {
     }
     if fail.Load() > 0 { log.Fatalf("完成，存在 %d 个 CSV 失败", fail.Load()) }
     log.Printf("全部完成，共处理 %d 个 CSV。", len(tasks))
+}
+func (s *DatabaseService) CountProcessed(ctx context.Context) (int, error) {
+    row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM jobs WHERE job_intro IS NOT NULL AND job_intro != '' AND status='处理完成'`)
+    var n int
+    if err := row.Scan(&n); err != nil { return 0, err }
+    return n, nil
+}
+
+func (s *DatabaseService) MarkProcessed(ctx context.Context, mid string) error {
+    _, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='处理完成' WHERE mid=?`, mid)
+    return err
 }
