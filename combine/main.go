@@ -919,6 +919,17 @@ func writeCountStrict(path string, total, processed, filtered, dbRows int64) err
 
 func processSingleCSV(ctx context.Context, t fileTask, opts options) error {
     log.Printf("[START] %s -> %s", t.csvPath, t.outDir)
+
+    // 在真正处理前做一次快速检查：
+    // 1) 若 output/<base>/count.txt 已存在，认为该 CSV 已完整，直接跳过；
+    // 2) 若不存在，则尝试基于现有产物(result.csv/ignore.csv/origin.db)回填一个 count.txt；
+    //    若数据完整（result+ignore==db），写入 count.txt 后跳过；
+    //    若不完整，则继续执行正常流程（导入->查询->写 count.txt）。
+    if skip, err := tryBackfillOrSkip(ctx, t); err != nil {
+        return err
+    } else if skip {
+        return nil
+    }
     // 建库
     db, err := ensureDB(t.dbPath)
     if err != nil { return fmt.Errorf("open sqlite failed: %w", err) }
@@ -957,6 +968,59 @@ func processSingleCSV(ctx context.Context, t fileTask, opts options) error {
     if err := writeCountStrict(t.countPath2, totalRows, resultRows, ignoreRows, int64(dbCount)); err != nil { return fmt.Errorf("write count.txt (output) failed: %w", err) }
     log.Printf("[DONE] %s -> result=%s origin.db=%s count=%s,%s", t.baseName, t.resultPath, t.dbPath, t.countPath, t.countPath2)
     return nil
+}
+
+// 在处理单个 CSV 前进行“是否可跳过/是否可回填 count.txt”的判断。
+// 返回值：
+// - skip=true  表示已存在 count.txt 或者已成功回填，当前 CSV 可直接跳过；
+// - skip=false 表示需要继续常规处理/续跑。
+func tryBackfillOrSkip(ctx context.Context, t fileTask) (bool, error) {
+    // 情况 A：输出目录已有 count.txt，视为已完成
+    if _, err := os.Stat(t.countPath2); err == nil {
+        log.Printf("[SKIP] %s: detected %s, assume completed", t.baseName, t.countPath2)
+        return true, nil
+    }
+
+    // 情况 B：没有 count.txt，尝试判断是否“数据已完整”，若完整则回填一个 count.txt
+    // 数据完整的定义与严格校验一致：result.csv 行数 + ignore.csv 行数 == DB 行数
+    // 若 DB 不存在或无法读取，则视为不完整，交由常规流程处理。
+    if _, err := os.Stat(t.dbPath); err != nil {
+        // 没有 DB，肯定不完整
+        return false, nil
+    }
+
+    dbSvc, err := NewDatabaseService(t.dbPath)
+    if err != nil {
+        // 无法打开 DB，按不完整处理
+        return false, nil
+    }
+    dbCount, err := dbSvc.CountJobs(ctx)
+    _ = dbSvc.Close()
+    if err != nil || dbCount <= 0 {
+        return false, nil
+    }
+
+    // 统计现有 CSV 产物的行数（缺失文件按 0 处理）
+    resultRows, err := countCSVRows(t.resultPath)
+    if err != nil { resultRows = 0 }
+    ignoreRows, err := countCSVRows(t.ignorePath)
+    if err != nil { ignoreRows = 0 }
+
+    if resultRows+ignoreRows == int64(dbCount) {
+        total := resultRows + ignoreRows
+        // 同步写入新旧两个位置，保持向后兼容
+        if err := writeCountStrict(t.countPath, total, resultRows, ignoreRows, int64(dbCount)); err != nil {
+            log.Printf("[BACKFILL] %s: write legacy count failed: %v", t.baseName, err)
+        }
+        if err := writeCountStrict(t.countPath2, total, resultRows, ignoreRows, int64(dbCount)); err != nil {
+            return false, fmt.Errorf("backfill count.txt failed: %w", err)
+        }
+        log.Printf("[BACKFILL] %s: wrote count.txt (total=%d processed=%d filtered=%d)", t.baseName, total, resultRows, ignoreRows)
+        return true, nil
+    }
+
+    log.Printf("[RESUME] %s: count.txt missing and data incomplete (db=%d, result=%d, ignore=%d), will continue.", t.baseName, dbCount, resultRows, ignoreRows)
+    return false, nil
 }
 
 func main() {
