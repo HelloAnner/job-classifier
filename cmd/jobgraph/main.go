@@ -24,7 +24,7 @@ import (
 
 const (
 	defaultClassificationPath = "classification.json"
-	defaultDBPath             = "data/job_graph.db"
+	defaultDBPath             = "db/job_graph.db"
 	defaultTopN               = 10
 	defaultWorkers            = 8
 	embeddingModel            = "quentinz/bge-large-zh-v1.5"

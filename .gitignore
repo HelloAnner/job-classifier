@@ -5,3 +5,7 @@ job-import
 job-query/
 data.zip
 *.log
+.codex/
+.claude/
+output/
+test/

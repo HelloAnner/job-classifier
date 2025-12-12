@@ -84,7 +84,7 @@ func main() {
 		limit  int
 	)
 
-	flag.StringVar(&dbPath, "db", "data/jobs.db", "SQLite 文件路径")
+	flag.StringVar(&dbPath, "db", "db/jobs.db", "SQLite 文件路径")
 	flag.IntVar(&limit, "limit", 0, "本次最多处理多少条岗位（0 表示全部）")
 	flag.Parse()
 

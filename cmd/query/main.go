@@ -27,8 +27,8 @@ const (
 	embeddingModel      = "quentinz/bge-large-zh-v1.5"
 	chromaDBURL         = "http://localhost:8000"
 	collectionName      = "job_classification"
-	databasePath        = "data/jobs.db"
-	graphDatabasePath   = "data/job_graph.db"
+	databasePath        = "db/jobs.db"
+	graphDatabasePath   = "db/job_graph.db"
 	similarityThreshold = 0.55
 	graphNeighborLimit  = 5
 )
@@ -448,10 +448,10 @@ type CSVWriter struct {
 
 func NewCSVWriter() (*CSVWriter, error) {
 	timestamp := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("result/%s_query_results.csv", timestamp)
+	filename := fmt.Sprintf("db/%s_query_results.csv", timestamp)
 
-	if err := os.MkdirAll("result", 0755); err != nil {
-		return nil, fmt.Errorf("failed to create result directory: %w", err)
+	if err := os.MkdirAll("db", 0755); err != nil {
+		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
 	file, err := os.Create(filename)
@@ -949,7 +949,7 @@ func main() {
 	}
 	defer processor.Close()
 
-	log.Printf("CSV file will be saved to result/ directory")
+	log.Printf("CSV file will be saved to db/ directory")
 
 	if err := processor.Process(ctx); err != nil {
 		log.Fatalf("Failed to process jobs: %v", err)

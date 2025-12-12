@@ -1,0 +1,139 @@
+# Makefile
+# 功能：统一启动 combine 全量处理与查看日志
+# 作者：Anner
+# 创建时间：2025/12/12
+
+# 默认平台（可通过 `make run 51job` 或 `make run bo` 覆盖）
+PLATFORM ?= 51job
+
+# 若 make 命令带了额外目标（例如 `make run 51job`），把第一个额外目标当作平台名
+EXTRA_GOALS := $(filter-out init start run log stop,$(MAKECMDGOALS))
+ifneq ($(EXTRA_GOALS),)
+PLATFORM := $(firstword $(EXTRA_GOALS))
+endif
+
+# 输入文件匹配规则：data/<platform>/<platform>*.csv
+INPUT ?= data/$(PLATFORM)/$(PLATFORM)*.csv
+
+# 推荐默认参数（基于历史单条速度很慢 + 已验证 /api/embed 批量可用）
+# 可通过 make run QUERY_WORKERS=20 EMB_BATCH=512 覆盖
+FILE_WORKERS ?= 1
+QUERY_WORKERS ?= 16
+EMB_BATCH ?= 384
+EMB_TIMEOUT ?= 600s
+CHROMA_TOPK ?= 200
+SQL_BATCH ?= 5000
+
+RUN_LOG ?= run.log
+PID_FILE ?= .run.pid
+
+# init 相关配置
+OLLAMA_HOST ?= http://localhost:11434
+CHROMA_HOST ?= http://localhost:8000
+EMB_MODEL ?= quentinz/bge-large-zh-v1.5
+CHROMA_IMAGE ?= chromadb/chroma
+CHROMA_CONTAINER ?= job-classifier-chroma
+
+.PHONY: init start run log stop
+
+init:
+	@set -e; \
+	echo "== 检查 Ollama 服务 =="; \
+	if ! command -v ollama >/dev/null 2>&1; then \
+		echo "未找到 ollama 命令，请先安装 Ollama。"; \
+		exit 1; \
+	fi; \
+	if ! curl -sSf "$(OLLAMA_HOST)/api/tags" >/dev/null 2>&1; then \
+		echo "Ollama 未启动或不可访问：$(OLLAMA_HOST)"; \
+		exit 1; \
+	fi; \
+	if ! curl -s "$(OLLAMA_HOST)/api/tags" | grep -q "$(EMB_MODEL)"; then \
+		echo "模型 $(EMB_MODEL) 未找到，开始拉取..."; \
+		ollama pull "$(EMB_MODEL)"; \
+	else \
+		echo "模型 $(EMB_MODEL) 已存在。"; \
+	fi; \
+	echo ""; \
+	echo "== 检查 Chroma 服务（Docker） =="; \
+	if ! command -v docker >/dev/null 2>&1; then \
+		echo "未找到 docker 命令，请先安装/启动 Docker Desktop。"; \
+		exit 1; \
+	fi; \
+	status=$$(curl -s -o /dev/null -w "%{http_code}" "$(CHROMA_HOST)/api/v2/tenants/default_tenant/databases/default_database/collections" || true); \
+	if [ "$$status" != "200" ]; then \
+		if docker ps -a --format "{{.Names}}" | grep -qx "$(CHROMA_CONTAINER)"; then \
+			echo "启动已有 Chroma 容器 $(CHROMA_CONTAINER)..."; \
+			docker start "$(CHROMA_CONTAINER)" >/dev/null; \
+		else \
+			echo "启动新 Chroma 容器 $(CHROMA_CONTAINER)（镜像：$(CHROMA_IMAGE)）..."; \
+			docker run -d --name "$(CHROMA_CONTAINER)" -p 8000:8000 "$(CHROMA_IMAGE)" >/dev/null; \
+		fi; \
+		echo "等待 Chroma 启动..."; \
+		for i in 1 2 3 4 5; do \
+			status=$$(curl -s -o /dev/null -w "%{http_code}" "$(CHROMA_HOST)/api/v2/tenants/default_tenant/databases/default_database/collections" || true); \
+			if [ "$$status" = "200" ]; then break; fi; \
+			sleep 2; \
+		done; \
+		if [ "$$status" != "200" ]; then \
+			echo "Chroma 仍不可访问，请手动检查：$(CHROMA_HOST)"; \
+			exit 1; \
+		fi; \
+	else \
+		echo "Chroma 已就绪。"; \
+	fi; \
+	echo ""; \
+	echo "== 初始化基础数据 =="; \
+	if [ ! -f "classification.json" ] && [ ! -f "data/classification.json" ]; then \
+		echo "未找到 classification.json（根目录或 data/ 下），请先放置分类基础文件。"; \
+		exit 1; \
+	fi; \
+	mkdir -p db; \
+	echo "1) 构建 Chroma 向量基础库（cmd/jobimport）..."; \
+	go run ./cmd/jobimport; \
+	echo "2) 构建职业知识图谱（cmd/jobgraph）..."; \
+	go run ./cmd/jobgraph --db=db/job_graph.db; \
+	echo "init 完成。"
+
+run:
+	@echo "Start combine..."
+	@nohup go run ./combine \
+		--input="$(INPUT)" \
+		--file-workers=$(FILE_WORKERS) \
+		--query-workers=$(QUERY_WORKERS) \
+		--emb-batch=$(EMB_BATCH) \
+		--emb-timeout=$(EMB_TIMEOUT) \
+		--chroma-topk=$(CHROMA_TOPK) \
+		--batch=$(SQL_BATCH) \
+		> $(RUN_LOG) 2>&1 & \
+		echo $$! > $(PID_FILE); \
+		echo "started platform=$(PLATFORM) pid=$$(cat $(PID_FILE)), log=$(RUN_LOG)"
+
+# 兼容旧命令：make start 等价于 make run
+start: run
+
+log:
+	@if [ ! -f "$(RUN_LOG)" ]; then \
+		echo "log file not found: $(RUN_LOG)"; \
+		exit 1; \
+	fi
+	@echo "== follow progress / tps / completed =="
+	@tail -n 200 -f "$(RUN_LOG)" | grep --line-buffered -E "Progress:|Query completed|tps="
+
+stop:
+	@echo "Stop combine processes (input=$(INPUT))..."
+	@pids=$$(ps -ax -o pid= -o command= | grep -F -- "combine" | grep -F -- "--input=$(INPUT)" | grep -v "grep" | awk '{print $$1}'); \
+	if [ -z "$$pids" ]; then \
+		pids=$$(ps -ax -o pid= -o command= | grep -F -- "combine" | grep -F -- "$(INPUT)" | grep -v "grep" | awk '{print $$1}'); \
+	fi; \
+	if [ -n "$$pids" ]; then \
+		echo "kill -9 $$pids"; \
+		kill -9 $$pids; \
+	else \
+		echo "no matching combine processes found"; \
+	fi; \
+	rm -f "$(PID_FILE)"
+
+# 额外平台目标只用于设置 PLATFORM，本身不执行任何动作
+.PHONY: $(EXTRA_GOALS)
+$(EXTRA_GOALS):
+	@:
