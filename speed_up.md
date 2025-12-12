@@ -181,6 +181,205 @@ combine 目录只有 `combine/main.go`，把原 `cmd/importer` + `cmd/query` 的
 
 对 170M 这种规模，重复率通常不低（岗位 JD 模板化严重），这是能否两天完成的决定性因素。
 
+#### A1. JD 近似去重缓存的落地设计（SQLite，db/ 下）
+
+你提出的“相同 JD 定义”是**频次向量近似相等**：  
+对每条 JD（已排除 ignore 的短文本），先做规范化与分词，只统计中文汉字与英文单词的频次；  
+若两个 JD 的频次差异（按 L1 距离/差异 token 数）≤ 5（阈值可配置 makefile 指定），则认为同一 JD，直接复用历史分类结果。
+
+下面给出**可直接实施**的算法与表结构设计，保证在 1.7 亿规模下仍可快速命中、且不降准确性。
+
+---
+
+## A1.1 文本规范化与频次构建
+
+对 `full`（`buildFullText(job)` 的结果）做两份输入：
+
+1. **Exact 版本（精确命中）**  
+   - 去除所有空白（空格、换行、tab）  
+   - 去除常见标点（中英文标点、特殊符号）  
+   - 英文统一小写  
+   - **不改变汉字顺序**  
+   得到 `exact_text`，对其做稳定 hash（建议 SHA‑256 前 16 字节 hex，或 xxhash64）作为 `exact_hash`。
+
+2. **Approx 版本（近似命中）**  
+   - 同样去空白/标点/小写  
+   - **只保留：汉字 rune + 英文单词 token**  
+   - 统计频次：`counts[token]++`  
+   - 记录总 token 数 `len_tokens`
+
+频次差异定义（建议实现为 L1 距离）：  
+```
+diff = Σ_token |countA(token) - countB(token)|
+命中条件: diff <= cache-threshold (默认 5)
+```
+
+---
+
+## A1.2 如何在巨大缓存里快速找候选
+
+不能 O(N) 对比 diff，需要“两级索引 + 小候选集合精算 diff”：
+
+1. **一级：Exact hash 命中（O(1)）**  
+   `exact_hash` 直接查缓存表。命中则 100% 复用。
+
+2. **二级：Approx 候选召回（O(logN)+小常数）**  
+   为 Approx 版本构造可索引的“桶键”，让相似 JD 进入同一/相邻桶。
+
+推荐组合（召回稳定、实现简单）：
+
+**(a) SimHash64 + 分 band 索引**  
+   - 基于 `counts[token]` 计算 SimHash64（权重=频次）  
+   - 切成 4 段 16bit：band1..band4  
+   - 近似相同文本通常在 ≥1 个 band 上完全一致  
+
+**(b) 长度过滤**  
+   - 候选必须满足：`abs(len_tokens - cand_len_tokens) <= cache-threshold`
+
+候选召回 SQL：
+```
+SELECT exact_hash, len_tokens, counts_blob, fine_job_id, similarity, meta_json
+FROM jd_cache
+WHERE (band1=? OR band2=? OR band3=? OR band4=?)
+  AND abs(len_tokens-?) <= ?
+LIMIT 200;
+```
+返回候选（一般几十条以内）后，在 Go 里做精确 diff 计算，命中即复用。
+
+---
+
+## A1.3 “几千常用汉字”词表与频次向量存储
+
+### 词表（静态/稳定）
+
+为保证跨文件/跨重跑可复用，建议做固定词表：
+
+- `ZH_DICT`: ~4096 个常用汉字（覆盖 JD 绝大多数用字）  
+- `EN_DICT`: ~4096 个常见英文单词（从历史数据统计 topN）  
+
+编号成稳定的 `token_id`（0..8191），并落盘到 `db/token_dict`：
+```
+token_id INTEGER PRIMARY KEY,
+token TEXT UNIQUE,
+kind TEXT   -- 'zh' / 'en'
+```
+
+combine 启动时一次性加载到内存 map：`map[string]uint16`。  
+词表规模小、命中 O(1)，是最快的方式。
+
+### 频次向量 BLOB（稀疏编码）
+
+每条 JD 的频次向量只存非零项：
+```
+[(token_id1, count1), (token_id2, count2), ...]  // token_id 升序
+```
+编码为 BLOB：
+- token_id: uint16（2B）  
+- count: uint8/uint16（JD 内单 token 频次通常<255）  
+
+每条 BLOB 通常几百字节。  
+diff 计算用双指针 merge，复杂度 O(nnzA+nnzB)，非常快。
+
+---
+
+## A1.4 缓存表结构（db/jd_cache.db）
+
+建议单独一个 SQLite 文件：`db/jd_cache.db`，避免与 per‑CSV `origin.db` 写锁互相影响。
+
+### 表 1：jd_cache（核心）
+
+```
+CREATE TABLE IF NOT EXISTS jd_cache (
+  exact_hash TEXT PRIMARY KEY,
+  simhash INTEGER NOT NULL,
+  band1 INTEGER NOT NULL,
+  band2 INTEGER NOT NULL,
+  band3 INTEGER NOT NULL,
+  band4 INTEGER NOT NULL,
+  len_tokens INTEGER NOT NULL,
+  counts_blob BLOB NOT NULL,
+
+  fine_job_id TEXT NOT NULL,
+  similarity REAL NOT NULL,
+  meta_json TEXT NOT NULL,
+
+  updated_at TEXT NOT NULL
+);
+```
+
+索引：
+```
+CREATE INDEX IF NOT EXISTS idx_jd_cache_band1 ON jd_cache(band1);
+CREATE INDEX IF NOT EXISTS idx_jd_cache_band2 ON jd_cache(band2);
+CREATE INDEX IF NOT EXISTS idx_jd_cache_band3 ON jd_cache(band3);
+CREATE INDEX IF NOT EXISTS idx_jd_cache_band4 ON jd_cache(band4);
+CREATE INDEX IF NOT EXISTS idx_jd_cache_len ON jd_cache(len_tokens);
+```
+
+### 表 2：fine_job_cache（静态元数据，可选）
+
+若不想命中后再去 Chroma/JSON 里找元数据，可加：
+```
+CREATE TABLE IF NOT EXISTS fine_job_cache (
+  fine_job_id TEXT PRIMARY KEY,
+  meta_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+```
+该表可在 `make init` 时从 `classification.json` 一次性导入。
+
+---
+
+## A1.5 写入与并发策略（保证存储/查询性能）
+
+SQLite 高并发写会锁竞争，推荐：
+
+1. **单 writer goroutine**  
+   worker 只发送“待写缓存结果”到 `cacheWriteCh`，writer 批事务 UPSERT（每 2k‑10k 条一批）。
+
+2. **WAL + NORMAL + 大 cache_size**  
+   dsn 类似：  
+   `_journal_mode=WAL&_synchronous=NORMAL&_busy_timeout=60000&_cache_size=200000`
+
+3. **只写成功处理完成的 JD**  
+   避免错误结果污染缓存；与 tps 统计一致。
+
+---
+
+## A1.6 命中后的复用
+
+命中缓存时：
+
+1. 直接拿 `fine_job_id + similarity + meta_json`  
+2. 用当前 job 的 MID/intro 拼装 CSV 行  
+3. **不调用 Ollama/Chroma/Graph**  
+
+因为 meta_json 来自历史真实计算，输出字段与现有流程一致。
+
+---
+
+## A1.7 参数（Makefile 可控）
+
+建议新增：
+
+- `--cache-threshold`（默认 5）  
+  Makefile：`CACHE_THRESHOLD ?= 5`
+
+- `--cache-candidates`（默认 200）  
+  二级召回候选上限，防止极端桶过大。
+
+---
+
+## A1.8 规模与收益预估
+
+JD 唯一文本数通常远小于总量。  
+假设 170M 中只有 20M 唯一 JD：
+- 缓存行数 ~20M  
+- 每行 counts_blob ~300B、meta_json ~500B、索引开销 ~200B  
+- 总体磁盘约 20M×1KB ≈ 20GB（M4 本机 NVMe 可承受）
+
+重复率 60% 时，embedding+Chroma 总耗时可压到 ~40%，是两天目标的决定性杠杆。
+
 ### 6.2 方案 B：Embedding 请求批量化（高收益，准确性零损失）
 
 **做法**  
