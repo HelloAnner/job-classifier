@@ -1173,40 +1173,37 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 		close(resultsCh)
 	}()
 
-	processedSession, matched := 0, 0
+	processedSession, processedOkSession, matched := 0, 0, 0
 	start := time.Now()
 	lastProgressTime := start
-	lastProgressCount := 0
+	lastProgressOkCount := 0
 	for res := range resultsCh {
 		// 仅在无错误时，标记处理完成
 		if res.err == nil {
 			if err := p.dbService.MarkProcessed(ctx, res.job.MID); err != nil {
 				log.Printf("Warning: mark processed failed mid=%s: %v", res.job.MID, err)
 			}
+			processedOkSession++
 		}
 		processedSession++
-		if processedSession == 1 || processedSession%50 == 0 {
-			curr := p.baseProcessed + processedSession
+		// 进度与 TPS 仅统计“真正成功处理完成”的数量
+		if processedOkSession == 1 || processedOkSession%50 == 0 {
+			curr := p.baseProcessed + processedOkSession
 			pct := 0.0
 			if p.totalAll > 0 {
 				pct = float64(curr) / float64(p.totalAll) * 100
 			}
-			// 计算区间 TPS（每 50 条一次）与整体平均 TPS
+			// 计算区间 TPS（每 50 条成功处理一次）
 			now := time.Now()
-			delta := processedSession - lastProgressCount
+			deltaOk := processedOkSession - lastProgressOkCount
 			intervalSec := now.Sub(lastProgressTime).Seconds()
 			tps := 0.0
-			if intervalSec > 0 && delta > 0 {
-				tps = float64(delta) / intervalSec
+			if intervalSec > 0 && deltaOk > 0 {
+				tps = float64(deltaOk) / intervalSec
 			}
-			avgSec := now.Sub(start).Seconds()
-			avgTPS := 0.0
-			if avgSec > 0 {
-				avgTPS = float64(processedSession) / avgSec
-			}
-			log.Printf("Progress: %d/%d (%.1f%%) tps=%.2f/s avg=%.2f/s", curr, p.totalAll, pct, tps, avgTPS)
+			log.Printf("Progress: %d/%d (%.1f%%) tps=%.2f/s", curr, p.totalAll, pct, tps)
 			lastProgressTime = now
-			lastProgressCount = processedSession
+			lastProgressOkCount = processedOkSession
 			// 持久化进度基线，确保断点续跑继续从该位置显示
 			writeResumeBase(p.csvWriter.file.Name(), curr)
 		}
@@ -1228,7 +1225,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 			}
 		}
 	}
-	curr := p.baseProcessed + processedSession
+	curr := p.baseProcessed + processedOkSession
 	log.Printf("Query completed! total=%d processed=%d matched(>=%.2f)=%d elapsed=%.2fs", p.totalAll, curr, p.minSim, matched, time.Since(start).Seconds())
 	writeResumeBase(p.csvWriter.file.Name(), curr)
 	return rows.Err()

@@ -95,8 +95,17 @@ init:
 	echo "init 完成。"
 
 run:
-	@echo "Start combine..."
-	@nohup go run ./combine \
+	@set -e; \
+	if [ ! -d "data" ]; then \
+		echo "data 目录不存在，请先准备 data/ 下的输入文件。"; \
+		exit 1; \
+	fi; \
+	if [ ! -d "output" ]; then \
+		echo "output 目录不存在，请先创建 output/ 目录。"; \
+		exit 1; \
+	fi; \
+	echo "Start combine..."; \
+	nohup go run ./combine \
 		--input="$(INPUT)" \
 		--file-workers=$(FILE_WORKERS) \
 		--query-workers=$(QUERY_WORKERS) \
@@ -105,8 +114,8 @@ run:
 		--chroma-topk=$(CHROMA_TOPK) \
 		--batch=$(SQL_BATCH) \
 		> $(RUN_LOG) 2>&1 & \
-		echo $$! > $(PID_FILE); \
-		echo "started platform=$(PLATFORM) pid=$$(cat $(PID_FILE)), log=$(RUN_LOG)"
+	echo $$! > $(PID_FILE); \
+	echo "started platform=$(PLATFORM) pid=$$(cat $(PID_FILE)), log=$(RUN_LOG)"
 
 # 兼容旧命令：make start 等价于 make run
 start: run
