@@ -9,3 +9,5 @@ data.zip
 .claude/
 output/
 test/
+*.pid
+db/

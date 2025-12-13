@@ -40,7 +40,7 @@ const (
 	ollamaAPIURL = "http://localhost:11434/api/embeddings"
 	// /api/embed 支持 input[] 批量 embedding（Ollama 新版）
 	ollamaEmbedBatchURL = "http://localhost:11434/api/embed"
-	embeddingModel      = "quentinz/bge-large-zh-v1.5"
+	defaultEmbModel     = "qllama/bge-small-zh-v1.5:latest"
 	chromaDBURL         = "http://localhost:8000"
 	collectionName      = "job_classification"
 	graphNeighborLimit  = 5
@@ -50,6 +50,7 @@ const (
 // ===== CLI 选项 =====
 type options struct {
 	inputPath    string        // 目录或单个 CSV
+	embModel     string        // embedding 模型
 	batchSize    int           // 导入时事务批量
 	queryWorkers int           // 查询阶段的并发（默认与 cmd/query 的 10 一致）
 	embBatch     int           // embedding 批量大小（/api/embed input[]）
@@ -63,12 +64,17 @@ type options struct {
 
 func parseFlags() options {
 	var opts options
+	envModel := os.Getenv("EMB_MODEL")
+	if strings.TrimSpace(envModel) == "" {
+		envModel = defaultEmbModel
+	}
 	flag.StringVar(&opts.inputPath, "input", "data/51job", "输入目录或单个CSV（例如 data/51job 或 data/51job/51job_2021.csv）")
+	flag.StringVar(&opts.embModel, "emb-model", envModel, "embedding 模型名称（默认取环境 EMB_MODEL，空则使用内置默认）")
 	flag.IntVar(&opts.batchSize, "batch", 2000, "导入 SQLite 的提交批量")
 	flag.IntVar(&opts.queryWorkers, "query-workers", 10, "每个CSV在查询阶段的并发数")
 	flag.IntVar(&opts.embBatch, "emb-batch", 256, "embedding 批量大小（使用 /api/embed input[]；越大吞吐越高但单次延迟越大）")
 	flag.DurationVar(&opts.embTimeout, "emb-timeout", 300*time.Second, "embedding 请求超时（批量模式下建议>=300s）")
-	flag.IntVar(&opts.chromaTopK, "chroma-topk", 200, "Chroma 查询返回 topK（默认200；仅取 top1+图纠偏，过大浪费）")
+	flag.IntVar(&opts.chromaTopK, "chroma-topk", 5, "Chroma 查询返回 topK（默认5；仅取 top1+图纠偏）")
 	flag.BoolVar(&opts.trace, "trace", false, "开启逐条记录阶段日志（用于准确性排查）")
 	flag.IntVar(&opts.limitJobs, "limit-jobs", 0, "仅处理前 N 条岗位（0 表示全部）")
 	flag.BoolVar(&opts.clean, "clean", false, "存在输出目录时先清空再重跑（默认增量续跑）")
@@ -85,6 +91,9 @@ func parseFlags() options {
 	}
 	if opts.chromaTopK < 1 {
 		opts.chromaTopK = 1
+	}
+	if strings.TrimSpace(opts.embModel) == "" {
+		opts.embModel = defaultEmbModel
 	}
 	return opts
 }
@@ -499,8 +508,14 @@ func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	}
 	return out[0], nil
 }
+
+// 当前使用的 embedding 模型（优先 CLI/env 配置）
+var embModelInUse = defaultEmbModel
+
+func currentEmbModel() string { return embModelInUse }
+
 func (s *EmbeddingService) GetEmbeddings(texts []string) ([][]float32, error) {
-	reqBody := EmbedBatchRequest{Model: embeddingModel, Input: texts, KeepAlive: -1}
+	reqBody := EmbedBatchRequest{Model: currentEmbModel(), Input: texts, KeepAlive: -1}
 	data, _ := json.Marshal(reqBody)
 	resp, err := s.client.Post(ollamaEmbedBatchURL, "application/json", bytes.NewBuffer(data))
 	if err != nil {
@@ -1285,8 +1300,8 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 		}
 	}()
 
-	// 异步写 CSV（单线程顺序写），大缓冲减少阻塞
-	writeCh := make(chan jobResult, 20000)
+	// 异步写 CSV（单线程顺序写），无界缓冲通道，处理与写盘完全解耦
+	writeCh := make(chan jobResult, 0)
 	var writerWG sync.WaitGroup
 	writerWG.Add(1)
 	go func() {
@@ -1781,6 +1796,7 @@ func tryBackfillOrSkip(ctx context.Context, t fileTask) (bool, error) {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	opts := parseFlags()
+	embModelInUse = opts.embModel
 	ctx := context.Background()
 	files, err := discoverCSV(opts.inputPath)
 	if err != nil {

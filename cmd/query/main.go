@@ -24,7 +24,7 @@ import (
 
 const (
 	ollamaAPIURL        = "http://localhost:11434/api/embeddings"
-	embeddingModel      = "quentinz/bge-large-zh-v1.5"
+	defaultEmbModel     = "qllama/bge-small-zh-v1.5:latest"
 	chromaDBURL         = "http://localhost:8000"
 	collectionName      = "job_classification"
 	databasePath        = "db/jobs.db"
@@ -79,7 +79,7 @@ type EmbeddingResponse struct {
 
 func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	reqBody := EmbeddingRequest{
-		Model:  embeddingModel,
+		Model:  currentEmbModel(),
 		Prompt: text,
 	}
 
@@ -105,6 +105,13 @@ func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	}
 
 	return embeddingResp.Embedding, nil
+}
+
+func currentEmbModel() string {
+	if m := strings.TrimSpace(os.Getenv("EMB_MODEL")); m != "" {
+		return m
+	}
+	return defaultEmbModel
 }
 
 type DatabaseService struct {

@@ -27,73 +27,77 @@ INPUT ?= $(PLATFORM_DIR)/*.csv
 # 单文件处理：默认一次只处理 1 个 CSV，避免同时多文件导致系统卡顿
 QUERY_WORKERS ?= 48
 # 收敛批量，降低单次 /api/embed 压力，减少超时
-EMB_BATCH ?= 128
+EMB_BATCH ?= 256
 EMB_TIMEOUT ?= 600s
-CHROMA_TOPK ?= 150
+# Chroma 仅取前 5 个候选，加快查询与反序列化
+CHROMA_TOPK ?= 5
 SQL_BATCH ?= 5000
+# 默认 embedding 模型（512 维）。如切换模型，需重新 init（会清空 chroma-data 重建索引）
 
 RUN_LOG ?= run_$(PLATFORM_LC).log
 PID_FILE ?= .run.$(PLATFORM_LC).pid
 
 # init 相关配置
-OLLAMA_HOST ?= http://localhost:11434
+OLLAMA_HOST ?= http://127.0.0.1:11434
 CHROMA_HOST ?= http://localhost:8000
-EMB_MODEL ?= quentinz/bge-large-zh-v1.5
+EMB_MODEL ?= qllama/bge-small-zh-v1.5:latest
 CHROMA_IMAGE ?= chromadb/chroma
 CHROMA_CONTAINER ?= job-classifier-chroma
 
 .PHONY: init start run log stop
 
 init:
-	@set -e; \
-	echo "== 检查 Ollama 服务 =="; \
+	@echo "== 检查 Ollama 服务 =="; \
 	if ! command -v ollama >/dev/null 2>&1; then \
-		echo "未找到 ollama 命令，请先安装 Ollama。"; \
-		exit 1; \
+		echo "未找到 ollama 命令，请先安装 Ollama。"; exit 1; \
 	fi; \
-	if ! curl -sSf "$(OLLAMA_HOST)/api/tags" >/dev/null 2>&1; then \
-		echo "Ollama 未启动或不可访问：$(OLLAMA_HOST)"; \
-		exit 1; \
+	if ! ollama list >/dev/null 2>&1; then \
+		echo "Ollama 未启动或不可访问，请先启动 ollama serve (或 Ollama.app)。"; exit 1; \
 	fi; \
-	if ! curl -s "$(OLLAMA_HOST)/api/tags" | grep -q "$(EMB_MODEL)"; then \
-		echo "模型 $(EMB_MODEL) 未找到，开始拉取..."; \
-		ollama pull "$(EMB_MODEL)"; \
-	else \
+	if ollama show "$(EMB_MODEL)" >/dev/null 2>&1; then \
 		echo "模型 $(EMB_MODEL) 已存在。"; \
+	else \
+		echo "模型 $(EMB_MODEL) 未找到，开始拉取..."; \
+		if ! ollama pull "$(EMB_MODEL)"; then \
+			echo "模型 $(EMB_MODEL) 拉取失败，请检查网络后重试"; exit 1; \
+		fi; \
 	fi; \
 	echo ""; \
 	echo "== 检查 Chroma 服务（Docker） =="; \
 	if ! command -v docker >/dev/null 2>&1; then \
-		echo "未找到 docker 命令，请先安装/启动 Docker Desktop。"; \
-		exit 1; \
+		echo "未找到 docker 命令，请先安装/启动 Docker Desktop。"; exit 1; \
 	fi; \
-	status=$$(curl -s -o /dev/null -w "%{http_code}" "$(CHROMA_HOST)/api/v2/tenants/default_tenant/databases/default_database/collections" || true); \
+	echo "重建 Chroma 容器 $(CHROMA_CONTAINER)，使用性能优先参数..."; \
+		: # 若 8000 端口已被其它容器占用，先清理掉；避免 bind 失败 \
+	old8000=$$(docker ps -aq --filter "publish=8000"); \
+	if [ -n "$$old8000" ]; then \
+		echo "检测到占用 8000 端口的容器：$$old8000，正在移除..."; \
+		docker rm -f $$old8000 >/dev/null 2>&1 || true; \
+	fi; \
+	docker rm -f "$(CHROMA_CONTAINER)" >/dev/null 2>&1 || true; \
+	rm -rf chroma-data; mkdir -p chroma-data; \
+	docker run -d --name "$(CHROMA_CONTAINER)" \
+		-p 8000:8000 \
+		-v "$$(pwd)/chroma-data":/chroma/index \
+		-e CHROMA_SERVER_HTTP_THREADS=8 \
+		-e CHROMA_SERVER_WORKERS=8 \
+		-e CHROMA_SERVER_CORS_ALLOW_ORIGINS="*" \
+		"$(CHROMA_IMAGE)" >/dev/null; \
+	echo "等待 Chroma 启动..."; \
+	for i in $$(seq 1 30); do \
+		status=$$(curl -s -o /dev/null -w "%{http_code}" "$(CHROMA_HOST)/api/v2/tenants/default_tenant/databases/default_database/collections" || true); \
+		if [ "$$status" = "200" ]; then break; fi; \
+		sleep 2; \
+	done; \
 	if [ "$$status" != "200" ]; then \
-		if docker ps -a --format "{{.Names}}" | grep -qx "$(CHROMA_CONTAINER)"; then \
-			echo "启动已有 Chroma 容器 $(CHROMA_CONTAINER)..."; \
-			docker start "$(CHROMA_CONTAINER)" >/dev/null; \
-		else \
-			echo "启动新 Chroma 容器 $(CHROMA_CONTAINER)（镜像：$(CHROMA_IMAGE)）..."; \
-			docker run -d --name "$(CHROMA_CONTAINER)" -p 8000:8000 "$(CHROMA_IMAGE)" >/dev/null; \
-		fi; \
-		echo "等待 Chroma 启动..."; \
-		for i in 1 2 3 4 5; do \
-			status=$$(curl -s -o /dev/null -w "%{http_code}" "$(CHROMA_HOST)/api/v2/tenants/default_tenant/databases/default_database/collections" || true); \
-			if [ "$$status" = "200" ]; then break; fi; \
-			sleep 2; \
-		done; \
-		if [ "$$status" != "200" ]; then \
-			echo "Chroma 仍不可访问，请手动检查：$(CHROMA_HOST)"; \
-			exit 1; \
-		fi; \
+		echo "Chroma 仍不可访问，请手动检查：$(CHROMA_HOST)"; exit 1; \
 	else \
-		echo "Chroma 已就绪。"; \
+		echo "Chroma 已就绪，线程=8, workers=8, 数据目录=./chroma-data"; \
 	fi; \
 	echo ""; \
 	echo "== 初始化基础数据 =="; \
 	if [ ! -f "classification.json" ] && [ ! -f "data/classification.json" ]; then \
-		echo "未找到 classification.json（根目录或 data/ 下），请先放置分类基础文件。"; \
-		exit 1; \
+		echo "未找到 classification.json（根目录或 data/ 下），请先放置分类基础文件。"; exit 1; \
 	fi; \
 	mkdir -p db; \
 	echo "1) 构建 Chroma 向量基础库（cmd/jobimport）..."; \

@@ -27,7 +27,7 @@ const (
 	defaultDBPath             = "db/job_graph.db"
 	defaultTopN               = 10
 	defaultWorkers            = 8
-	embeddingModel            = "quentinz/bge-large-zh-v1.5"
+	defaultEmbModel           = "qllama/bge-small-zh-v1.5:latest"
 	ollamaAPIURL              = "http://localhost:11434/api/embeddings"
 	chromaDBURL               = "http://localhost:8000"
 	collectionName            = "job_classification"
@@ -40,15 +40,21 @@ type options struct {
 	topN               int
 	workers            int
 	timeout            time.Duration
+	embModel           string
 }
 
 func parseFlags() options {
 	var opts options
+	envModel := strings.TrimSpace(os.Getenv("EMB_MODEL"))
+	if envModel == "" {
+		envModel = defaultEmbModel
+	}
 	flag.StringVar(&opts.classificationPath, "input", defaultClassificationPath, "classification JSON path")
 	flag.StringVar(&opts.dbPath, "db", defaultDBPath, "output SQLite path")
 	flag.IntVar(&opts.topN, "top", defaultTopN, "neighbor count to store per job")
 	flag.IntVar(&opts.workers, "workers", defaultWorkers, "embedding concurrency")
 	flag.DurationVar(&opts.timeout, "timeout", 120*time.Second, "embedding HTTP timeout")
+	flag.StringVar(&opts.embModel, "emb-model", envModel, "embedding model (default from EMB_MODEL env or built-in)")
 	flag.Parse()
 
 	if opts.topN <= 0 {
@@ -83,6 +89,8 @@ type jobVector struct {
 	Embedding []float32
 }
 
+var embModelInUse = defaultEmbModel
+
 type EmbeddingService struct {
 	client *http.Client
 }
@@ -106,7 +114,7 @@ type embeddingResponse struct {
 
 func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	reqBody := embeddingRequest{
-		Model:  embeddingModel,
+		Model:  embModelInUse,
 		Prompt: text,
 	}
 
@@ -140,6 +148,7 @@ func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 
 func main() {
 	opts := parseFlags()
+	embModelInUse = opts.embModel
 
 	if err := os.MkdirAll(filepath.Dir(opts.dbPath), 0o755); err != nil {
 		log.Fatalf("failed to create db directory: %v", err)

@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,13 +19,22 @@ import (
 )
 
 const (
-	ollamaAPIURL       = "http://localhost:11434/api/embeddings"
-	embeddingModel     = "quentinz/bge-large-zh-v1.5"
-	chromaDBURL        = "http://localhost:8000"
-	collectionName     = "job_classification"
-	embeddingDimension = 1024
-	batchSize          = 50
+	ollamaAPIURL    = "http://localhost:11434/api/embeddings"
+	defaultEmbModel = "qllama/bge-small-zh-v1.5:latest"
+	chromaDBURL     = "http://localhost:8000"
+	collectionName  = "job_classification"
+	defaultEmbDim   = 512
+	batchSize       = 50
 )
+
+func currentEmbDim() int {
+	if v := strings.TrimSpace(os.Getenv("EMB_DIM")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultEmbDim
+}
 
 type JobClassification struct {
 	中类                  string   `json:"中类"`
@@ -71,7 +81,7 @@ type EmbeddingResponse struct {
 
 func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	reqBody := EmbeddingRequest{
-		Model:  embeddingModel,
+		Model:  currentEmbModel(),
 		Prompt: text,
 	}
 
@@ -97,6 +107,13 @@ func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	}
 
 	return embeddingResp.Embedding, nil
+}
+
+func currentEmbModel() string {
+	if m := strings.TrimSpace(os.Getenv("EMB_MODEL")); m != "" {
+		return m
+	}
+	return defaultEmbModel
 }
 
 type ChromaRepository struct {
@@ -224,7 +241,7 @@ func (r *ChromaRepository) createCollection(ctx context.Context) (string, error)
 		"metadata": map[string]interface{}{
 			"hnsw:space": "cosine",
 		},
-		"dimension": embeddingDimension,
+		"dimension": currentEmbDim(),
 	}
 
 	body, err := json.Marshal(payload)
