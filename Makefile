@@ -3,29 +3,37 @@
 # 作者：Anner
 # 创建时间：2025/12/12
 
-# 默认平台（可通过 `make run 51job` 或 `make run bo` 覆盖）
-PLATFORM ?= 51job
-
 # 若 make 命令带了额外目标（例如 `make run 51job`），把第一个额外目标当作平台名
 EXTRA_GOALS := $(filter-out init start run log stop,$(MAKECMDGOALS))
 ifneq ($(EXTRA_GOALS),)
 PLATFORM := $(firstword $(EXTRA_GOALS))
 endif
 
-# 输入文件匹配规则：data/<platform>/<platform>*.csv
-INPUT ?= data/$(PLATFORM)/$(PLATFORM)*.csv
+# 默认平台（可通过 `make run 51job` 或 `make run bo` 覆盖）
+PLATFORM ?= 51job
+# 平台名统一转小写，便于匹配大小写不同的数据目录
+PLATFORM_LC := $(shell echo $(PLATFORM) | tr 'A-Z' 'a-z')
 
-# 推荐默认参数（基于历史单条速度很慢 + 已验证 /api/embed 批量可用）
-# 可通过 make run QUERY_WORKERS=20 EMB_BATCH=512 覆盖
-FILE_WORKERS ?= 1
-QUERY_WORKERS ?= 16
-EMB_BATCH ?= 384
+# 尝试在 data/ 下大小写不敏感地找到平台目录，找不到则回退原路径
+PLATFORM_DIR ?= $(shell find data -maxdepth 1 -type d -iname "$(PLATFORM)" | head -n 1)
+ifeq ($(strip $(PLATFORM_DIR)),)
+PLATFORM_DIR := data/$(PLATFORM)
+endif
+
+# 输入文件匹配规则：data/<platform>/*.csv（平台目录大小写不敏感）
+INPUT ?= $(PLATFORM_DIR)/*.csv
+
+# 推荐默认参数（稳态优先，可通过 make run QUERY_WORKERS=80 EMB_BATCH=256 覆盖）
+# 单文件处理：默认一次只处理 1 个 CSV，避免同时多文件导致系统卡顿
+QUERY_WORKERS ?= 48
+# 收敛批量，降低单次 /api/embed 压力，减少超时
+EMB_BATCH ?= 128
 EMB_TIMEOUT ?= 600s
-CHROMA_TOPK ?= 200
+CHROMA_TOPK ?= 150
 SQL_BATCH ?= 5000
 
-RUN_LOG ?= run.log
-PID_FILE ?= .run.pid
+RUN_LOG ?= run_$(PLATFORM_LC).log
+PID_FILE ?= .run.$(PLATFORM_LC).pid
 
 # init 相关配置
 OLLAMA_HOST ?= http://localhost:11434
@@ -104,10 +112,18 @@ run:
 		echo "output 目录不存在，请先创建 output/ 目录。"; \
 		exit 1; \
 	fi; \
-	echo "Start combine..."; \
+	input_files="$(wildcard $(INPUT))"; \
+	if [ -z "$$input_files" ]; then \
+		echo "未找到输入 CSV：$(INPUT)"; \
+		echo "请确认 data/ 下存在平台目录（大小写不敏感），例如 data/BO/*.csv"; \
+		exit 1; \
+	fi; \
+	files_count=$$(set -- $$input_files; echo $$#); \
+	echo "Start combine (platform=$(PLATFORM), dir=$(PLATFORM_DIR), files=$$files_count)"; \
+	echo "INPUT pattern: $(INPUT)"; \
+	echo "Workers: query=$(QUERY_WORKERS) emb-batch=$(EMB_BATCH) chroma-topk=$(CHROMA_TOPK)"; \
 	nohup go run ./combine \
 		--input="$(INPUT)" \
-		--file-workers=$(FILE_WORKERS) \
 		--query-workers=$(QUERY_WORKERS) \
 		--emb-batch=$(EMB_BATCH) \
 		--emb-timeout=$(EMB_TIMEOUT) \
@@ -125,18 +141,30 @@ log:
 		echo "log file not found: $(RUN_LOG)"; \
 		exit 1; \
 	fi
-	@echo "== follow progress / tps / completed =="
-	@tail -n 200 -f "$(RUN_LOG)" | grep --line-buffered -E "Progress:|Query completed|tps="
+	@echo "== tail $(RUN_LOG) =="
+	@tail -f "$(RUN_LOG)"
 
 stop:
-	@echo "Stop combine processes (input=$(INPUT))..."
-	@pids=$$(ps -ax -o pid= -o command= | grep -F -- "combine" | grep -F -- "--input=$(INPUT)" | grep -v "grep" | awk '{print $$1}'); \
+	@echo "Stop combine processes (platform=$(PLATFORM), input=$(INPUT))..."
+	@pids=""; \
+	if [ -f "$(PID_FILE)" ]; then \
+		pid=$$(cat "$(PID_FILE)"); \
+		if ps -p $$pid >/dev/null 2>&1; then \
+			pids="$$pid"; \
+		fi; \
+	fi; \
 	if [ -z "$$pids" ]; then \
-		pids=$$(ps -ax -o pid= -o command= | grep -F -- "combine" | grep -F -- "$(INPUT)" | grep -v "grep" | awk '{print $$1}'); \
+		pids=$$(pgrep -f "combine .*--input=$(INPUT)"); \
+	fi; \
+	if [ -z "$$pids" ]; then \
+		pids=$$(pgrep -f "combine .*$(INPUT)"); \
 	fi; \
 	if [ -n "$$pids" ]; then \
-		echo "kill -9 $$pids"; \
-		kill -9 $$pids; \
+		for p in $$pids; do \
+			echo "kill -9 $$p (and its children)"; \
+			pkill -9 -P $$p 2>/dev/null || true; \
+			kill -9 $$p 2>/dev/null || true; \
+		done; \
 	else \
 		echo "no matching combine processes found"; \
 	fi; \

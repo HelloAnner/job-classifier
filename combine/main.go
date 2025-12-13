@@ -27,7 +27,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -52,7 +51,6 @@ const (
 // ===== CLI 选项 =====
 type options struct {
 	inputPath    string        // 目录或单个 CSV
-	fileWorkers  int           // 同时处理多少个 CSV
 	batchSize    int           // 导入时事务批量
 	queryWorkers int           // 查询阶段的并发（默认与 cmd/query 的 10 一致）
 	embBatch     int           // embedding 批量大小（/api/embed input[]）
@@ -67,11 +65,6 @@ type options struct {
 func parseFlags() options {
 	var opts options
 	flag.StringVar(&opts.inputPath, "input", "data/51job", "输入目录或单个CSV（例如 data/51job 或 data/51job/51job_2021.csv）")
-	defFW := runtime.NumCPU()
-	if defFW < 2 {
-		defFW = 2
-	}
-	flag.IntVar(&opts.fileWorkers, "file-workers", defFW/2, "同时处理的 CSV 文件数量")
 	flag.IntVar(&opts.batchSize, "batch", 2000, "导入 SQLite 的提交批量")
 	flag.IntVar(&opts.queryWorkers, "query-workers", 10, "每个CSV在查询阶段的并发数")
 	flag.IntVar(&opts.embBatch, "emb-batch", 256, "embedding 批量大小（使用 /api/embed input[]；越大吞吐越高但单次延迟越大）")
@@ -82,9 +75,6 @@ func parseFlags() options {
 	flag.BoolVar(&opts.clean, "clean", false, "存在输出目录时先清空再重跑（默认增量续跑）")
 	flag.Float64Var(&opts.minSim, "min-sim", 0.0, "最低相似度阈值（仅日志提示，不拒绝落表；默认0.0）")
 	flag.Parse()
-	if opts.fileWorkers < 1 {
-		opts.fileWorkers = 1
-	}
 	if opts.batchSize < 1 {
 		opts.batchSize = 1
 	}
@@ -481,8 +471,9 @@ type EmbeddingResponse struct {
 
 // /api/embed 批量 embedding 的请求/响应
 type EmbedBatchRequest struct {
-	Model string   `json:"model"`
-	Input []string `json:"input"`
+	Model     string      `json:"model"`
+	Input     []string    `json:"input"`
+	KeepAlive interface{} `json:"keep_alive,omitempty"`
 }
 type EmbedBatchResponse struct {
 	Embeddings [][]float32 `json:"embeddings"`
@@ -510,7 +501,7 @@ func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	return out[0], nil
 }
 func (s *EmbeddingService) GetEmbeddings(texts []string) ([][]float32, error) {
-	reqBody := EmbedBatchRequest{Model: embeddingModel, Input: texts}
+	reqBody := EmbedBatchRequest{Model: embeddingModel, Input: texts, KeepAlive: -1}
 	data, _ := json.Marshal(reqBody)
 	resp, err := s.client.Post(ollamaEmbedBatchURL, "application/json", bytes.NewBuffer(data))
 	if err != nil {
@@ -529,6 +520,32 @@ func (s *EmbeddingService) GetEmbeddings(texts []string) ([][]float32, error) {
 		return nil, fmt.Errorf("ollama batch embeddings size mismatch: got=%d expect=%d", len(out.Embeddings), len(texts))
 	}
 	return out.Embeddings, nil
+}
+
+// 在批量 embedding 失败时（典型为超时），递归拆分批次，保证尽量返回成功结果，避免长时间卡住。
+func getEmbeddingsWithRetry(svc *EmbeddingService, texts []string) ([][]float32, error) {
+	embs, err := svc.GetEmbeddings(texts)
+	if err == nil {
+		return embs, nil
+	}
+	if len(texts) <= 1 {
+		return nil, err
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout") {
+		mid := len(texts) / 2
+		if mid < 1 {
+			mid = 1
+		}
+		log.Printf("[EMB-RETRY-SPLIT] size=%d -> %d+%d due to: %v", len(texts), mid, len(texts)-mid, err)
+		left, errL := getEmbeddingsWithRetry(svc, texts[:mid])
+		right, errR := getEmbeddingsWithRetry(svc, texts[mid:])
+		if errL == nil && errR == nil {
+			return append(left, right...), nil
+		}
+		// 若任一侧仍失败，返回原始错误
+	}
+	return nil, err
 }
 
 // Graph repo
@@ -1048,6 +1065,68 @@ func NewQueryProcessor(ctx context.Context, dbPath, resultPath, graphDBPath stri
 	log.Printf("History processed=%d/%d, remaining=%d", baseDB, totalAll, remaining)
 	return qp, nil
 }
+
+// Chroma 批量查询时若 topK 很大，批次过大会触发 SQLite 参数上限(999)。
+// 这里按 topK 计算一个安全的最大批次；若仍报错则降级为单条查询，保证任务能继续推进。
+func (p *QueryProcessor) queryChromaWithSplit(ctx context.Context, jobs []JobRecord, embeddings [][]float32, resultsCh chan<- jobResult) {
+	maxBatch := 1
+	if p.chromaTopK > 0 {
+		maxBatch = 900 / p.chromaTopK
+	}
+	if maxBatch < 1 {
+		maxBatch = 1
+	}
+	for start := 0; start < len(jobs); start += maxBatch {
+		end := start + maxBatch
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		subJobs := jobs[start:end]
+		subEmb := embeddings[start:end]
+		if p.trace {
+			log.Printf("[CHROMA-BATCH-REQ] size=%d n_results=%d (split)", len(subJobs), p.chromaTopK)
+		}
+		resp, err := p.chromaRepo.QueryBatch(ctx, subEmb, p.chromaTopK)
+		if err != nil && strings.Contains(err.Error(), "too many SQL variables") {
+			for i, job := range subJobs {
+				if p.trace {
+					log.Printf("[CHROMA-RETRY-SINGLE] mid=%s", job.MID)
+				}
+				p.queryChromaSingle(ctx, job, subEmb[i], resultsCh)
+			}
+			continue
+		}
+		if err != nil {
+			for _, job := range subJobs {
+				resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Failed to query ChromaDB (batch) for job %s: %v", job.MID, err)}
+			}
+			continue
+		}
+		for i, job := range subJobs {
+			if i >= len(resp.Distances) || i >= len(resp.Metadatas) {
+				resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Chroma batch response size mismatch: distances=%d metadatas=%d expect=%d", len(resp.Distances), len(resp.Metadatas), len(subJobs))}
+				continue
+			}
+			resultsCh <- p.processSingleJobWithLists(ctx, job, resp.Metadatas[i], resp.Distances[i])
+		}
+	}
+}
+
+func (p *QueryProcessor) queryChromaSingle(ctx context.Context, job JobRecord, embedding []float32, resultsCh chan<- jobResult) {
+	if p.trace {
+		log.Printf("[CHROMA-REQ] mid=%s n_results=%d (single)", job.MID, p.chromaTopK)
+	}
+	qresp, err := p.chromaRepo.Query(ctx, embedding, p.chromaTopK)
+	if err != nil {
+		resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Failed to query ChromaDB for job %s: %v", job.MID, err)}
+		return
+	}
+	if len(qresp.Metadatas) == 0 || len(qresp.Distances) == 0 {
+		resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Chroma response empty for job %s", job.MID)}
+		return
+	}
+	resultsCh <- p.processSingleJobWithLists(ctx, job, qresp.Metadatas[0], qresp.Distances[0])
+}
 func (p *QueryProcessor) Close() {
 	p.dbService.Close()
 	if p.graphRepo != nil {
@@ -1102,7 +1181,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 				if p.trace {
 					log.Printf("[EMB-BATCH-REQ] size=%d", len(batchJobs))
 				}
-				embeddings, err := p.embeddingSvc.GetEmbeddings(batchTexts)
+				embeddings, err := getEmbeddingsWithRetry(p.embeddingSvc, batchTexts)
 				if err != nil {
 					for _, job := range batchJobs {
 						resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Failed to get batch embedding for job %s: %v", job.MID, err)}
@@ -1126,23 +1205,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 				if len(normJobs) == 0 {
 					continue
 				}
-				if p.trace {
-					log.Printf("[CHROMA-BATCH-REQ] size=%d n_results=%d", len(normJobs), p.chromaTopK)
-				}
-				qresp, err := p.chromaRepo.QueryBatch(ctx, normEmbeddings, p.chromaTopK)
-				if err != nil {
-					for _, job := range normJobs {
-						resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Failed to query ChromaDB (batch) for job %s: %v", job.MID, err)}
-					}
-					continue
-				}
-				for i, job := range normJobs {
-					if i >= len(qresp.Distances) || i >= len(qresp.Metadatas) {
-						resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Chroma batch response size mismatch: distances=%d metadatas=%d expect=%d", len(qresp.Distances), len(qresp.Metadatas), len(normJobs))}
-						continue
-					}
-					resultsCh <- p.processSingleJobWithLists(ctx, job, qresp.Metadatas[i], qresp.Distances[i])
-				}
+				p.queryChromaWithSplit(ctx, normJobs, normEmbeddings, resultsCh)
 			}
 		}()
 	}
@@ -1175,8 +1238,81 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 
 	processedSession, processedOkSession, matched := 0, 0, 0
 	start := time.Now()
-	lastProgressTime := start
-	lastProgressOkCount := 0
+	// 记录上一次进度日志的时间与成功数，用真实时间跨度计算 TPS
+	lastLogTime := start
+	lastLogOk := 0
+	// 周期性统计输出（每 5s），包含 tps/avg 与当前 result 路径
+	statTicker := time.NewTicker(5 * time.Second)
+	defer statTicker.Stop()
+	doneStat := make(chan struct{})
+	var okCounter atomic.Int64
+	okCounter.Store(0)
+	go func() {
+		prevTime := start
+		prevOk := int64(0)
+		for now := range statTicker.C {
+			select {
+			case <-doneStat:
+				return
+			default:
+			}
+			currOk := okCounter.Load()
+			deltaOk := currOk - prevOk
+			deltaSec := now.Sub(prevTime).Seconds()
+			tps := 0.0
+			if deltaSec > 0 {
+				tps = float64(deltaOk) / deltaSec
+			}
+			totalSec := now.Sub(start).Seconds()
+			tpsAvg := 0.0
+			if totalSec > 0 {
+				tpsAvg = float64(currOk) / totalSec
+			}
+			curr := p.baseProcessed + int(currOk)
+			pct := 0.0
+			if p.totalAll > 0 {
+				pct = float64(curr) / float64(p.totalAll) * 100
+			}
+			log.Printf("[STAT] progress=%d/%d (%.2f%%) tps=%.2f/s avg=%.2f/s result=%s", curr, p.totalAll, pct, tps, tpsAvg, p.csvWriter.file.Name())
+			prevTime = now
+			prevOk = currOk
+		}
+	}()
+
+	// 异步写 CSV，避免写磁盘阻塞计算线程
+	writeCh := make(chan jobResult, 2000)
+	var writerWG sync.WaitGroup
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		pending := 0
+		for {
+			select {
+			case res, ok := <-writeCh:
+				if !ok {
+					_ = p.csvWriter.Flush()
+					return
+				}
+				if err := p.csvWriter.WriteRow(res.job, res.similarity, res.metadata); err != nil {
+					log.Printf("Warning: write csv row failed: %v", err)
+				}
+				pending++
+				if pending%500 == 0 {
+					if err := p.csvWriter.Flush(); err != nil {
+						log.Printf("Warning: csv flush failed: %v", err)
+					}
+				}
+			case <-ticker.C:
+				if err := p.csvWriter.Flush(); err != nil {
+					log.Printf("Warning: csv flush failed: %v", err)
+				}
+				log.Printf("[CSV] current result file: %s", p.csvWriter.file.Name())
+			}
+		}
+	}()
+
 	for res := range resultsCh {
 		// 仅在无错误时，标记处理完成
 		if res.err == nil {
@@ -1184,6 +1320,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 				log.Printf("Warning: mark processed failed mid=%s: %v", res.job.MID, err)
 			}
 			processedOkSession++
+			okCounter.Add(1)
 		}
 		processedSession++
 		// 进度与 TPS 仅统计“真正成功处理完成”的数量
@@ -1193,17 +1330,21 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 			if p.totalAll > 0 {
 				pct = float64(curr) / float64(p.totalAll) * 100
 			}
-			// 计算区间 TPS（每 50 条成功处理一次）
 			now := time.Now()
-			deltaOk := processedOkSession - lastProgressOkCount
-			intervalSec := now.Sub(lastProgressTime).Seconds()
-			tps := 0.0
-			if intervalSec > 0 && deltaOk > 0 {
-				tps = float64(deltaOk) / intervalSec
+			deltaOk := processedOkSession - lastLogOk
+			deltaSec := now.Sub(lastLogTime).Seconds()
+			tpsCur := 0.0
+			if deltaSec > 0 {
+				tpsCur = float64(deltaOk) / deltaSec
 			}
-			log.Printf("Progress: %d/%d (%.1f%%) tps=%.2f/s", curr, p.totalAll, pct, tps)
-			lastProgressTime = now
-			lastProgressOkCount = processedOkSession
+			totalSec := now.Sub(start).Seconds()
+			tpsAvg := 0.0
+			if totalSec > 0 {
+				tpsAvg = float64(processedOkSession) / totalSec
+			}
+			log.Printf("Progress: %d/%d (%.1f%%) tps=%.2f/s avg=%.2f/s", curr, p.totalAll, pct, tpsCur, tpsAvg)
+			lastLogTime = now
+			lastLogOk = processedOkSession
 			// 持久化进度基线，确保断点续跑继续从该位置显示
 			writeResumeBase(p.csvWriter.file.Name(), curr)
 		}
@@ -1213,18 +1354,12 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 		}
 		if res.matched {
 			matched++
-			if err := p.csvWriter.WriteRow(res.job, res.similarity, res.metadata); err != nil {
-				log.Printf("Warning: write csv row failed: %v", err)
-			}
-			if matched%100 == 0 {
-				if err := p.csvWriter.Flush(); err != nil {
-					log.Printf("Warning: csv flush failed: %v", err)
-				} else {
-					log.Printf("Auto-saved CSV after %d matched records", matched)
-				}
-			}
+			writeCh <- res
 		}
 	}
+	close(writeCh)
+	writerWG.Wait()
+	close(doneStat)
 	curr := p.baseProcessed + processedOkSession
 	log.Printf("Query completed! total=%d processed=%d matched(>=%.2f)=%d elapsed=%.2fs", p.totalAll, curr, p.minSim, matched, time.Since(start).Seconds())
 	writeResumeBase(p.csvWriter.file.Name(), curr)
@@ -1671,47 +1806,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("build tasks failed: %v", err)
 	}
-	log.Printf("发现 %d 个 CSV，将并发处理（file-workers=%d）", len(tasks), opts.fileWorkers)
+	// 单文件顺序处理：逐个 CSV 依次执行，避免多文件同时占用资源
+	log.Printf("发现 %d 个 CSV，将按顺序逐个处理（单文件模式）", len(tasks))
 
-	// 并发处理不同 CSV
-	type result struct {
-		name string
-		err  error
-	}
-	jobs := make(chan fileTask)
-	results := make(chan result)
-	var wg sync.WaitGroup
-	for i := 0; i < opts.fileWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for t := range jobs {
-				if err := processSingleCSV(ctx, t, opts); err != nil {
-					results <- result{name: t.baseName, err: err}
-				} else {
-					results <- result{name: t.baseName}
-				}
-			}
-		}()
-	}
-	go func() {
-		for _, t := range tasks {
-			jobs <- t
-		}
-		close(jobs)
-		wg.Wait()
-		close(results)
-	}()
-
-	var fail atomic.Int32
-	for res := range results {
-		if res.err != nil {
-			fail.Add(1)
-			log.Printf("[ERROR] %s: %v", res.name, res.err)
+	var failCount int
+	for _, t := range tasks {
+		if err := processSingleCSV(ctx, t, opts); err != nil {
+			failCount++
+			log.Printf("[ERROR] %s: %v", t.baseName, err)
 		}
 	}
-	if fail.Load() > 0 {
-		log.Fatalf("完成，存在 %d 个 CSV 失败", fail.Load())
+	if failCount > 0 {
+		log.Fatalf("完成，存在 %d 个 CSV 失败", failCount)
 	}
 	log.Printf("全部完成，共处理 %d 个 CSV。", len(tasks))
 }
