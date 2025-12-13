@@ -1241,8 +1241,8 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 	// 记录上一次进度日志的时间与成功数，用真实时间跨度计算 TPS
 	lastLogTime := start
 	lastLogOk := 0
-	// 周期性统计输出（每 5s），包含 tps/avg 与当前 result 路径
-	statTicker := time.NewTicker(5 * time.Second)
+	// 周期性统计输出（每 1s），汇总所有 worker 成功数，计算真实 TPS 与平均值
+	statTicker := time.NewTicker(1 * time.Second)
 	defer statTicker.Stop()
 	doneStat := make(chan struct{})
 	var okCounter atomic.Int64
