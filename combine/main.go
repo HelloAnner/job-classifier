@@ -1237,8 +1237,8 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 
 	processedSession, processedOkSession, matched := 0, 0, 0
 	start := time.Now()
-	// 周期性统计输出（每 1s），基于完成通道汇总真实 TPS 与平均值
-	statTicker := time.NewTicker(1 * time.Second)
+	// 周期性统计输出（每 5s），基于完成通道汇总真实 TPS 与平均值
+	statTicker := time.NewTicker(5 * time.Second)
 	defer statTicker.Stop()
 	doneStat := make(chan struct{})
 	completionCh := make(chan struct{}, 10000)
