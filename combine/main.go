@@ -30,7 +30,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -1238,44 +1237,51 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 
 	processedSession, processedOkSession, matched := 0, 0, 0
 	start := time.Now()
-	// 记录上一次进度日志的时间与成功数，用真实时间跨度计算 TPS
-	lastLogTime := start
-	lastLogOk := 0
-	// 周期性统计输出（每 1s），汇总所有 worker 成功数，计算真实 TPS 与平均值
+	// 周期性统计输出（每 1s），基于完成通道汇总真实 TPS 与平均值
 	statTicker := time.NewTicker(1 * time.Second)
 	defer statTicker.Stop()
 	doneStat := make(chan struct{})
-	var okCounter atomic.Int64
-	okCounter.Store(0)
+	completionCh := make(chan struct{}, 10000)
 	go func() {
+		defer statTicker.Stop()
 		prevTime := start
-		prevOk := int64(0)
-		for now := range statTicker.C {
+		var totalOk int64
+		for {
 			select {
+			case <-statTicker.C:
+				// 取出过去 1s 内完成的数量
+				deltaOk := 0
+				for {
+					select {
+					case <-completionCh:
+						deltaOk++
+					default:
+						goto drained
+					}
+				}
+			drained:
+				now := time.Now()
+				deltaSec := now.Sub(prevTime).Seconds()
+				tps := 0.0
+				if deltaSec > 0 {
+					tps = float64(deltaOk) / deltaSec
+				}
+				totalOk += int64(deltaOk)
+				totalSec := now.Sub(start).Seconds()
+				tpsAvg := 0.0
+				if totalSec > 0 {
+					tpsAvg = float64(totalOk) / totalSec
+				}
+				curr := p.baseProcessed + int(totalOk)
+				pct := 0.0
+				if p.totalAll > 0 {
+					pct = float64(curr) / float64(p.totalAll) * 100
+				}
+				log.Printf("[STAT] progress=%.2f%% tps=%.2f/s avg=%.2f/s result=%s", pct, tps, tpsAvg, p.csvWriter.file.Name())
+				prevTime = now
 			case <-doneStat:
 				return
-			default:
 			}
-			currOk := okCounter.Load()
-			deltaOk := currOk - prevOk
-			deltaSec := now.Sub(prevTime).Seconds()
-			tps := 0.0
-			if deltaSec > 0 {
-				tps = float64(deltaOk) / deltaSec
-			}
-			totalSec := now.Sub(start).Seconds()
-			tpsAvg := 0.0
-			if totalSec > 0 {
-				tpsAvg = float64(currOk) / totalSec
-			}
-			curr := p.baseProcessed + int(currOk)
-			pct := 0.0
-			if p.totalAll > 0 {
-				pct = float64(curr) / float64(p.totalAll) * 100
-			}
-			log.Printf("[STAT] progress=%d/%d (%.2f%%) tps=%.2f/s avg=%.2f/s result=%s", curr, p.totalAll, pct, tps, tpsAvg, p.csvWriter.file.Name())
-			prevTime = now
-			prevOk = currOk
 		}
 	}()
 
@@ -1285,7 +1291,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 	writerWG.Add(1)
 	go func() {
 		defer writerWG.Done()
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		pending := 0
 		for {
@@ -1308,7 +1314,6 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 				if err := p.csvWriter.Flush(); err != nil {
 					log.Printf("Warning: csv flush failed: %v", err)
 				}
-				log.Printf("[CSV] current result file: %s", p.csvWriter.file.Name())
 			}
 		}
 	}()
@@ -1320,32 +1325,15 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 				log.Printf("Warning: mark processed failed mid=%s: %v", res.job.MID, err)
 			}
 			processedOkSession++
-			okCounter.Add(1)
+			select {
+			case completionCh <- struct{}{}:
+			default:
+			}
 		}
 		processedSession++
-		// 进度与 TPS 仅统计“真正成功处理完成”的数量
+		// 周期性写入断点（无进度日志输出，降低日志噪音）
 		if processedOkSession == 1 || processedOkSession%50 == 0 {
 			curr := p.baseProcessed + processedOkSession
-			pct := 0.0
-			if p.totalAll > 0 {
-				pct = float64(curr) / float64(p.totalAll) * 100
-			}
-			now := time.Now()
-			deltaOk := processedOkSession - lastLogOk
-			deltaSec := now.Sub(lastLogTime).Seconds()
-			tpsCur := 0.0
-			if deltaSec > 0 {
-				tpsCur = float64(deltaOk) / deltaSec
-			}
-			totalSec := now.Sub(start).Seconds()
-			tpsAvg := 0.0
-			if totalSec > 0 {
-				tpsAvg = float64(processedOkSession) / totalSec
-			}
-			log.Printf("Progress: %d/%d (%.1f%%) tps=%.2f/s avg=%.2f/s", curr, p.totalAll, pct, tpsCur, tpsAvg)
-			lastLogTime = now
-			lastLogOk = processedOkSession
-			// 持久化进度基线，确保断点续跑继续从该位置显示
 			writeResumeBase(p.csvWriter.file.Name(), curr)
 		}
 		if res.err != nil {
