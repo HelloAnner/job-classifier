@@ -1285,13 +1285,13 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 		}
 	}()
 
-	// 异步写 CSV，避免写磁盘阻塞计算线程
-	writeCh := make(chan jobResult, 2000)
+	// 异步写 CSV（单线程顺序写），大缓冲减少阻塞
+	writeCh := make(chan jobResult, 20000)
 	var writerWG sync.WaitGroup
 	writerWG.Add(1)
 	go func() {
 		defer writerWG.Done()
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 		pending := 0
 		for {
@@ -1305,7 +1305,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 					log.Printf("Warning: write csv row failed: %v", err)
 				}
 				pending++
-				if pending%500 == 0 {
+				if pending%2000 == 0 {
 					if err := p.csvWriter.Flush(); err != nil {
 						log.Printf("Warning: csv flush failed: %v", err)
 					}
