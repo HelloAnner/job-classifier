@@ -47,6 +47,42 @@ const (
 	similarityThreshold = 0.55
 )
 
+// ===== HTTP Client 连接池配置 =====
+var (
+	// HTTP Client 连接池，避免频繁创建和销毁
+	httpClientPool = sync.Pool{
+		New: func() interface{} {
+			return &http.Client{
+				Timeout: 300 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: 100,
+					IdleConnTimeout:     90 * time.Second,
+					DisableCompression:  false,
+					DisableKeepAlives:   false,
+				},
+			}
+		},
+	}
+
+	// Chroma专用的HTTP Client（较短超时）
+	chromaClientPool = sync.Pool{
+		New: func() interface{} {
+			return &http.Client{
+				Timeout: 30 * time.Second,
+				Transport: &http.Transport{
+					MaxIdleConns:        50,
+					MaxIdleConnsPerHost: 50,
+					IdleConnTimeout:     60 * time.Second,
+				},
+			}
+		},
+	}
+
+	// Embedding 缓存（全局单例）
+	embeddingCache = NewEmbeddingCache(10000) // 缓存10000个embedding
+)
+
 // ===== CLI 选项 =====
 type options struct {
 	inputPath    string        // 目录或单个 CSV
@@ -253,6 +289,14 @@ func ensureDB(dbPath string) (*sql.DB, error) {
 		`CREATE INDEX IF NOT EXISTS idx_jobs_source ON jobs(source);`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_category ON jobs(category);`,
+		// 优化StreamJobs查询的复合索引（SQLite支持条件索引）
+		`CREATE INDEX IF NOT EXISTS idx_jobs_status_jobintro ON jobs(status, job_intro) WHERE job_intro IS NOT NULL AND job_intro != '';`,
+		// 优化mid查询的索引
+		`CREATE INDEX IF NOT EXISTS idx_jobs_mid ON jobs(mid);`,
+		// 优化状态过滤查询（SQLite支持条件索引）
+		`CREATE INDEX IF NOT EXISTS idx_jobs_status_not_done ON jobs(status) WHERE status NOT IN ('处理完成', '过滤');`,
+		// 复合索引：status + mid，用于排序和过滤
+		`CREATE INDEX IF NOT EXISTS idx_jobs_status_mid ON jobs(status, mid);`,
 	}
 	for _, stmt := range schema {
 		if _, err := db.Exec(stmt); err != nil {
@@ -459,11 +503,12 @@ func (s *DatabaseService) CountJobs(ctx context.Context) (int, error) {
 }
 
 func (s *DatabaseService) StreamJobs(ctx context.Context) (*sql.Rows, error) {
-	// 只流式返回“未处理完成且未被过滤”的岗位，用于续跑
+	// 只流式返回"未处理完成且未被过滤"的岗位，用于续跑
+	// 优化查询以利用复合索引
 	return s.db.QueryContext(ctx, `SELECT mid, job_intro, structured_json, source, status, category
         FROM jobs
-        WHERE job_intro IS NOT NULL AND job_intro != ''
-          AND status!='处理完成' AND status!='过滤'
+        WHERE status IN ('待处理', '处理中')  -- 使用IN代替NOT IN，有时性能更好
+          AND job_intro IS NOT NULL AND job_intro != ''
         ORDER BY mid`)
 }
 
@@ -492,10 +537,31 @@ func NewEmbeddingService() *EmbeddingService {
 }
 
 func NewEmbeddingServiceWithTimeout(timeout time.Duration) *EmbeddingService {
-	if timeout <= 0 {
-		timeout = 300 * time.Second
+	client := httpClientPool.Get().(*http.Client)
+	// 如果提供了不同的超时时间，创建新的client
+	if timeout != 300*time.Second {
+		httpClientPool.Put(client) // 放回池中
+		client = &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		}
 	}
-	return &EmbeddingService{client: &http.Client{Timeout: timeout}}
+	return &EmbeddingService{client: client}
+}
+
+// Close 方法用于释放资源
+func (s *EmbeddingService) Close() {
+	if s.client != nil {
+		// 检查是否是标准超时的client，是则放回池中
+		if s.client.Timeout == 300*time.Second {
+			httpClientPool.Put(s.client)
+		}
+		s.client = nil
+	}
 }
 func (s *EmbeddingService) GetEmbedding(text string) ([]float32, error) {
 	// 兼容单条：复用批量接口
@@ -562,6 +628,204 @@ func getEmbeddingsWithRetry(svc *EmbeddingService, texts []string) ([][]float32,
 	return nil, err
 }
 
+// ===== Embedding 缓存实现 =====
+
+// EmbeddingCacheItem 缓存项
+type EmbeddingCacheItem struct {
+	embedding []float32
+	timestamp time.Time
+}
+
+// EmbeddingCache LRU缓存实现
+type EmbeddingCache struct {
+	mu    sync.RWMutex
+	cache map[string]*EmbeddingCacheItem
+	order []string // LRU顺序
+	maxSize int
+}
+
+// NewEmbeddingCache 创建新的embedding缓存
+func NewEmbeddingCache(maxSize int) *EmbeddingCache {
+	if maxSize <= 0 {
+		maxSize = 1000
+	}
+	return &EmbeddingCache{
+		cache:   make(map[string]*EmbeddingCacheItem),
+		order:   make([]string, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// Get 从缓存中获取embedding
+func (c *EmbeddingCache) Get(key string) ([]float32, bool) {
+	c.mu.RLock()
+	item, exists := c.cache[key]
+	c.mu.RUnlock()
+
+	if !exists {
+		return nil, false
+	}
+
+	// 更新访问时间（移到最近使用）
+	c.mu.Lock()
+	// 从order中移除
+	for i, k := range c.order {
+		if k == key {
+			c.order = append(c.order[:i], c.order[i+1:]...)
+			break
+		}
+	}
+	// 添加到末尾
+	c.order = append(c.order, key)
+	item.timestamp = time.Now()
+	c.mu.Unlock()
+
+	// 返回副本，避免外部修改
+	result := make([]float32, len(item.embedding))
+	copy(result, item.embedding)
+	return result, true
+}
+
+// Set 设置缓存项
+func (c *EmbeddingCache) Set(key string, embedding []float32) {
+	if len(embedding) == 0 {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 如果已存在，更新
+	if _, exists := c.cache[key]; exists {
+		// 更新embedding
+		c.cache[key].embedding = make([]float32, len(embedding))
+		copy(c.cache[key].embedding, embedding)
+		c.cache[key].timestamp = time.Now()
+
+		// 移到最近使用
+		for i, k := range c.order {
+			if k == key {
+				c.order = append(c.order[:i], c.order[i+1:]...)
+				break
+			}
+		}
+		c.order = append(c.order, key)
+		return
+	}
+
+	// 如果缓存已满，移除最久未使用的
+	if len(c.order) >= c.maxSize {
+		oldestKey := c.order[0]
+		delete(c.cache, oldestKey)
+		c.order = c.order[1:]
+	}
+
+	// 添加新项
+	c.cache[key] = &EmbeddingCacheItem{
+		embedding: make([]float32, len(embedding)),
+		timestamp: time.Now(),
+	}
+	copy(c.cache[key].embedding, embedding)
+	c.order = append(c.order, key)
+}
+
+// Size 返回缓存大小
+func (c *EmbeddingCache) Size() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.cache)
+}
+
+// Clear 清空缓存
+func (c *EmbeddingCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = make(map[string]*EmbeddingCacheItem)
+	c.order = make([]string, 0, c.maxSize)
+}
+
+// generateCacheKey 生成缓存键
+func generateCacheKey(text string) string {
+	hash := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(hash[:16]) // 使用前16字节作为键
+}
+
+// GetEmbeddingsWithCache 带缓存的embedding获取
+func GetEmbeddingsWithCache(svc *EmbeddingService, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return [][]float32{}, nil
+	}
+
+	// 检查缓存
+	cachedResults := make([][]float32, len(texts))
+	uncachedTexts := make([]string, 0, len(texts))
+	uncachedIndices := make([]int, 0, len(texts))
+
+	for i, text := range texts {
+		key := generateCacheKey(text)
+		if emb, found := embeddingCache.Get(key); found {
+			cachedResults[i] = emb
+		} else {
+			uncachedTexts = append(uncachedTexts, text)
+			uncachedIndices = append(uncachedIndices, i)
+		}
+	}
+
+	// 所有结果都在缓存中
+	if len(uncachedTexts) == 0 {
+		return cachedResults, nil
+	}
+
+	// 获取未缓存的embedding
+	uncachedEmbs, err := svc.GetEmbeddings(uncachedTexts)
+	if err != nil {
+		return nil, err
+	}
+
+	// 合并结果并更新缓存
+	for j, idx := range uncachedIndices {
+		if j < len(uncachedEmbs) {
+			emb := uncachedEmbs[j]
+			cachedResults[idx] = emb
+
+			// 更新缓存
+			key := generateCacheKey(uncachedTexts[j])
+			embeddingCache.Set(key, emb)
+		}
+	}
+
+	return cachedResults, nil
+}
+
+// getEmbeddingsWithRetryAndCache 带缓存的embedding获取，支持重试
+func getEmbeddingsWithRetryAndCache(svc *EmbeddingService, texts []string) ([][]float32, error) {
+	// 首先尝试使用缓存
+	embs, err := GetEmbeddingsWithCache(svc, texts)
+	if err == nil {
+		return embs, nil
+	}
+
+	// 如果失败，使用原始的重试逻辑
+	if len(texts) <= 1 {
+		return nil, err
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout") {
+		mid := len(texts) / 2
+		if mid < 1 {
+			mid = 1
+		}
+		log.Printf("[EMB-RETRY-SPLIT] size=%d -> %d+%d due to: %v", len(texts), mid, len(texts)-mid, err)
+		left, errL := getEmbeddingsWithRetryAndCache(svc, texts[:mid])
+		right, errR := getEmbeddingsWithRetryAndCache(svc, texts[mid:])
+		if errL == nil && errR == nil {
+			return append(left, right...), nil
+		}
+		// 若任一侧仍失败，返回原始错误
+	}
+	return nil, err
+}
+
 // Graph repo
 type GraphRepository struct{ db *sql.DB }
 type graphNeighbor struct {
@@ -610,11 +874,21 @@ type ChromaRepository struct {
 }
 
 func NewChromaRepository(ctx context.Context) (*ChromaRepository, error) {
-	r := &ChromaRepository{httpClient: &http.Client{Timeout: 30 * time.Second}}
+	client := chromaClientPool.Get().(*http.Client)
+	r := &ChromaRepository{httpClient: client}
 	if err := r.loadCollectionID(ctx); err != nil {
+		chromaClientPool.Put(client) // 出错时放回池中
 		return nil, err
 	}
 	return r, nil
+}
+
+// Close 方法用于释放资源
+func (r *ChromaRepository) Close() {
+	if r.httpClient != nil {
+		chromaClientPool.Put(r.httpClient)
+		r.httpClient = nil
+	}
 }
 func (r *ChromaRepository) loadCollectionID(ctx context.Context) error {
 	url := fmt.Sprintf("%s/api/v2/tenants/default_tenant/databases/default_database/collections/%s", chromaDBURL, collectionName)
@@ -929,6 +1203,17 @@ type QueryProcessor struct {
 	baseProcessed int
 	totalAll      int
 	minSim        float64
+
+	// 批量更新相关字段
+	pendingMids   []string          // 待批量更新的MID列表
+	pendingMu     sync.Mutex        // 保护pendingMids的互斥锁
+	batchSize     int               // 批量更新的大小
+	flushTicker   *time.Ticker      // 定期刷新定时器
+	flushWG       sync.WaitGroup    // 等待刷新goroutine完成
+
+	// worker专用的context
+	cancelFunc    context.CancelFunc  // 用于取消worker
+	workerCtx     context.Context     // worker的context
 }
 type jobResult struct {
 	job        JobRecord
@@ -1056,6 +1341,9 @@ func NewQueryProcessor(ctx context.Context, dbPath, resultPath, graphDBPath stri
 		totalAll = 0
 	}
 
+	// 创建可取消的context
+	workerCtx, cancelFunc := context.WithCancel(context.Background())
+
 	qp := &QueryProcessor{
 		dbService:     dbService,
 		embeddingSvc:  NewEmbeddingServiceWithTimeout(embTimeout),
@@ -1071,6 +1359,15 @@ func NewQueryProcessor(ctx context.Context, dbPath, resultPath, graphDBPath stri
 		baseProcessed: baseDB,
 		totalAll:      totalAll,
 		minSim:        minSim,
+
+		// 批量更新初始化
+		pendingMids: make([]string, 0, 100),
+		batchSize:   100, // 默认批量大小
+		flushTicker: time.NewTicker(5 * time.Second), // 5秒刷新一次
+
+		// worker专用的context
+		cancelFunc:  cancelFunc,
+		workerCtx:   workerCtx,
 	}
 	remaining := totalAll - baseDB
 	if remaining < 0 {
@@ -1142,14 +1439,104 @@ func (p *QueryProcessor) queryChromaSingle(ctx context.Context, job JobRecord, e
 	resultsCh <- p.processSingleJobWithLists(ctx, job, qresp.Metadatas[0], qresp.Distances[0])
 }
 func (p *QueryProcessor) Close() {
+	// 取消所有worker
+	if p.cancelFunc != nil {
+		p.cancelFunc()
+	}
+
+	// 刷新所有待处理的MID
+	p.flushPendingMids(context.Background())
+
+	// 等待所有刷新goroutine完成
+	p.flushWG.Wait()
+
 	p.dbService.Close()
 	if p.graphRepo != nil {
 		p.graphRepo.Close()
 	}
+	if p.embeddingSvc != nil {
+		p.embeddingSvc.Close()
+	}
+	if p.chromaRepo != nil {
+		p.chromaRepo.Close()
+	}
+	if p.flushTicker != nil {
+		p.flushTicker.Stop()
+	}
 	p.csvWriter.Close()
 }
 
+// addPendingMid 添加待更新的MID到缓冲区
+func (p *QueryProcessor) addPendingMid(mid string) {
+	p.pendingMu.Lock()
+	defer p.pendingMu.Unlock()
+
+	p.pendingMids = append(p.pendingMids, mid)
+
+	// 如果达到批量大小，立即刷新
+	if len(p.pendingMids) >= p.batchSize {
+		p.flushWG.Add(1)
+		go func() {
+			defer p.flushWG.Done()
+			// 使用background context，因为这个刷新操作应该完成
+			p.flushPendingMids(context.Background())
+		}()
+	}
+}
+
+// flushPendingMids 刷新缓冲区中的MID到数据库
+func (p *QueryProcessor) flushPendingMids(ctx context.Context) error {
+	p.pendingMu.Lock()
+	if len(p.pendingMids) == 0 {
+		p.pendingMu.Unlock()
+		return nil
+	}
+
+	// 复制数据并清空缓冲区
+	mids := make([]string, len(p.pendingMids))
+	copy(mids, p.pendingMids)
+	p.pendingMids = p.pendingMids[:0]
+	p.pendingMu.Unlock()
+
+	// 批量更新到数据库
+	if err := p.dbService.MarkProcessedBatchWithChunk(ctx, mids, p.batchSize); err != nil {
+		// 出错时重新添加回缓冲区（除了最后一部分）
+		p.pendingMu.Lock()
+		p.pendingMids = append(mids, p.pendingMids...)
+		p.pendingMu.Unlock()
+		return fmt.Errorf("failed to flush pending MIDs: %w", err)
+	}
+
+	if p.trace {
+		log.Printf("[BATCH-UPDATE] flushed %d MIDs", len(mids))
+	}
+
+	return nil
+}
+
+// startFlushWorker 启动定期刷新worker
+func (p *QueryProcessor) startFlushWorker() {
+	p.flushWG.Add(1)
+	go func() {
+		defer p.flushWG.Done()
+		for {
+			select {
+			case <-p.flushTicker.C:
+				if err := p.flushPendingMids(p.workerCtx); err != nil {
+					log.Printf("Warning: failed to flush pending MIDs: %v", err)
+				}
+			case <-p.workerCtx.Done():
+				return
+			}
+		}
+	}()
+}
+
 func (p *QueryProcessor) Process(ctx context.Context) error {
+	// 启动批量更新刷新worker
+	p.startFlushWorker()
+	defer p.flushPendingMids(ctx) // 处理完成后刷新剩余数据
+
 	// 基于历史基线计算剩余任务并打印
 	remaining := p.totalAll - p.baseProcessed
 	if remaining < 0 {
@@ -1195,7 +1582,7 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 				if p.trace {
 					log.Printf("[EMB-BATCH-REQ] size=%d", len(batchJobs))
 				}
-				embeddings, err := getEmbeddingsWithRetry(p.embeddingSvc, batchTexts)
+				embeddings, err := getEmbeddingsWithRetryAndCache(p.embeddingSvc, batchTexts)
 				if err != nil {
 					for _, job := range batchJobs {
 						resultsCh <- jobResult{job: job, err: fmt.Errorf("Warning: Failed to get batch embedding for job %s: %v", job.MID, err)}
@@ -1226,8 +1613,21 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 
 	// feeder：逐行从 DB 读取并投入 jobsCh，避免一次性加载到内存
 	go func() {
+		defer func() {
+			close(jobsCh)
+			wg.Wait()
+			close(resultsCh)
+		}()
+
 		sent := 0
 		for rows.Next() {
+			// 检查context是否已取消
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			var j JobRecord
 			if err := rows.Scan(&j.MID, &j.JobIntro, &j.Structured, &j.Source, &j.Status, &j.Category); err != nil {
 				log.Printf("Warning: scan job row failed: %v", err)
@@ -1239,15 +1639,17 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 					continue
 				}
 			}
-			jobsCh <- j
-			sent++
-			if p.limitJobs > 0 && sent >= p.limitJobs {
-				break
+
+			select {
+			case jobsCh <- j:
+				sent++
+				if p.limitJobs > 0 && sent >= p.limitJobs {
+					return
+				}
+			case <-ctx.Done():
+				return
 			}
 		}
-		close(jobsCh)
-		wg.Wait()
-		close(resultsCh)
 	}()
 
 	processedSession, processedOkSession, matched := 0, 0, 0
@@ -1336,9 +1738,8 @@ func (p *QueryProcessor) Process(ctx context.Context) error {
 	for res := range resultsCh {
 		// 仅在无错误时，标记处理完成
 		if res.err == nil {
-			if err := p.dbService.MarkProcessed(ctx, res.job.MID); err != nil {
-				log.Printf("Warning: mark processed failed mid=%s: %v", res.job.MID, err)
-			}
+			// 使用批量更新机制
+			p.addPendingMid(res.job.MID)
 			processedOkSession++
 			select {
 			case completionCh <- struct{}{}:
@@ -1556,6 +1957,130 @@ func buildTasks(csvFiles []string, opts options) ([]fileTask, error) {
 // 已被 streamCSVToDB 取代（保留占位避免接口变动）
 func writeIgnoreCSV(path string, header []string, rows []csvRow) error { return nil }
 
+// regenerateIgnoreCSV 从数据库重新生成ignore.csv
+func regenerateIgnoreCSV(ctx context.Context, t fileTask) error {
+	dbSvc, err := NewDatabaseService(t.dbPath)
+	if err != nil {
+		return fmt.Errorf("open database failed: %w", err)
+	}
+	defer dbSvc.Close()
+
+	// 查询状态为'过滤'的记录
+	rows, err := dbSvc.db.QueryContext(ctx, `SELECT mid, job_intro FROM jobs WHERE status='过滤'`)
+	if err != nil {
+		return fmt.Errorf("query filtered jobs failed: %w", err)
+	}
+	defer rows.Close()
+
+	// 创建ignore.csv
+	igf, err := os.Create(t.ignorePath)
+	if err != nil {
+		return fmt.Errorf("create ignore.csv failed: %w", err)
+	}
+	defer igf.Close()
+
+	igw := csv.NewWriter(igf)
+	if err := igw.Write([]string{"mid", "job_intro"}); err != nil {
+		return err
+	}
+
+	count := 0
+	for rows.Next() {
+		var mid, intro string
+		if err := rows.Scan(&mid, &intro); err != nil {
+			return fmt.Errorf("scan row failed: %w", err)
+		}
+		if err := igw.Write([]string{mid, intro}); err != nil {
+			return fmt.Errorf("write row failed: %w", err)
+		}
+		count++
+	}
+
+	igw.Flush()
+	if err := igw.Error(); err != nil {
+		return fmt.Errorf("flush csv failed: %w", err)
+	}
+
+	log.Printf("[IGNORE-REGEN] %s: regenerated ignore.csv with %d records", t.baseName, count)
+	return nil
+}
+
+// syncDBStatusFromResultCSV 根据result.csv同步数据库状态
+func syncDBStatusFromResultCSV(ctx context.Context, t fileTask) error {
+	dbSvc, err := NewDatabaseService(t.dbPath)
+	if err != nil {
+		return fmt.Errorf("open database failed: %w", err)
+	}
+	defer dbSvc.Close()
+
+	// 读取result.csv中的job_id
+	f, err := os.Open(t.resultPath)
+	if err != nil {
+		return fmt.Errorf("open result.csv failed: %w", err)
+	}
+	defer f.Close()
+
+	r := csv.NewReader(bufio.NewReader(f))
+	r.ReuseRecord = true
+	r.LazyQuotes = true
+	r.FieldsPerRecord = -1
+
+	// 读取表头
+	header, err := r.Read()
+	if err != nil {
+		return fmt.Errorf("read header failed: %w", err)
+	}
+
+	// 定位job_id列
+	jobIdx := 0
+	for i, h := range header {
+		if strings.TrimSpace(h) == "job_id" {
+			jobIdx = i
+			break
+		}
+	}
+
+	// 批量更新
+	batchSize := 1000
+	var mids []string
+	updated := 0
+
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read record failed: %w", err)
+		}
+
+		if jobIdx < len(rec) {
+			mid := strings.TrimSpace(rec[jobIdx])
+			if mid != "" {
+				mids = append(mids, mid)
+				if len(mids) >= batchSize {
+					if err := dbSvc.MarkProcessedBatch(ctx, mids); err != nil {
+						return fmt.Errorf("batch update failed: %w", err)
+					}
+					updated += len(mids)
+					mids = mids[:0]
+				}
+			}
+		}
+	}
+
+	// 更新剩余记录
+	if len(mids) > 0 {
+		if err := dbSvc.MarkProcessedBatch(ctx, mids); err != nil {
+			return fmt.Errorf("batch update failed: %w", err)
+		}
+		updated += len(mids)
+	}
+
+	log.Printf("[DB-SYNC] %s: updated %d records status to '处理完成'", t.baseName, updated)
+	return nil
+}
+
 func writeCountTXT(path string, st importStats) error {
 	ok := st.Imported+st.Filtered == st.Total
 	content := fmt.Sprintf("total=%d\nprocessed=%d\nfiltered=%d\nok=%v\n", st.Total, st.Imported, st.Filtered, ok)
@@ -1672,30 +2197,88 @@ func processSingleCSV(ctx context.Context, t fileTask, opts options) error {
 	} else if skip {
 		return nil
 	}
-	// 建库
-	db, err := ensureDB(t.dbPath)
-	if err != nil {
-		return fmt.Errorf("open sqlite failed: %w", err)
+
+	// 检查数据库是否已存在，如果存在则跳过导入步骤
+	dbExists := false
+	if _, err := os.Stat(t.dbPath); err == nil {
+		dbExists = true
+		log.Printf("[DB-EXISTS] %s: database already exists, skipping import", t.baseName)
 	}
-	// 流式读取 CSV -> ignore.csv + origin.db
-	stats, err := streamCSVToDB(ctx, t.csvPath, t.ignorePath, db, t.source, opts.batchSize, opts.trace)
-	if err != nil {
+
+	// 只有数据库不存在时才需要导入
+	if !dbExists {
+		// 建库
+		db, err := ensureDB(t.dbPath)
+		if err != nil {
+			return fmt.Errorf("open sqlite failed: %w", err)
+		}
+		// 流式读取 CSV -> ignore.csv + origin.db
+		stats, err := streamCSVToDB(ctx, t.csvPath, t.ignorePath, db, t.source, opts.batchSize, opts.trace)
+		if err != nil {
+			db.Close()
+			return fmt.Errorf("stream import failed: %w", err)
+		}
+		log.Printf("[IMPORT] total=%d to_import=%d filtered(<5)=%d", stats.Total, stats.Imported, stats.Filtered)
 		db.Close()
-		return fmt.Errorf("stream import failed: %w", err)
+	} else {
+		// 数据库已存在，检查是否需要创建ignore.csv
+		if _, err := os.Stat(t.ignorePath); os.IsNotExist(err) {
+			// 如果ignore.csv不存在，需要从数据库重新生成
+			log.Printf("[IGNORE-MISSING] %s: ignore.csv missing, will regenerate from database", t.baseName)
+			if err := regenerateIgnoreCSV(ctx, t); err != nil {
+				return fmt.Errorf("regenerate ignore.csv failed: %w", err)
+			}
+		}
 	}
-	log.Printf("[IMPORT] total=%d to_import=%d filtered(<5)=%d", stats.Total, stats.Imported, stats.Filtered)
-	db.Close()
+
 	// 查询（支持续跑）：若存在 result.csv，则从其中读取已处理 job_id 集合，并以追加方式写入
 	appendMode := false
 	processedSet := make(map[string]struct{})
 	if _, err := os.Stat(t.resultPath); err == nil {
 		appendMode = true
-		set, _, err := loadProcessedSet(t.resultPath)
-		if err != nil {
-			return fmt.Errorf("load processed set failed: %w", err)
+		// 优化：如果数据库已存在且状态正确，不需要加载所有已处理记录到内存
+		// 而是让StreamJobs只查询未处理的记录
+		if dbExists {
+			// 检查数据库状态是否已正确更新
+			dbSvc, err := NewDatabaseService(t.dbPath)
+			if err == nil {
+				processedCount, err := dbSvc.CountProcessed(ctx)
+				_ = dbSvc.Close()
+				if err == nil && processedCount > 0 {
+					// 数据库中有已处理的记录，让StreamJobs过滤掉它们
+					log.Printf("[RESUME-DB] %s: database has %d processed records, will skip loading result.csv to memory", t.baseName, processedCount)
+					// 不加载processedSet，让StreamJobs通过status过滤
+
+					// 尝试修复数据库状态：将result.csv中已处理的记录标记为'处理完成'
+					if err := syncDBStatusFromResultCSV(ctx, t); err != nil {
+						log.Printf("[WARN] %s: failed to sync db status from result.csv: %v", t.baseName, err)
+						// 回退到加载result.csv
+						set, _, err := loadProcessedSet(t.resultPath)
+						if err != nil {
+							return fmt.Errorf("load processed set failed: %w", err)
+						}
+						processedSet = set
+						log.Printf("[RESUME-CSV] %s: loaded %d processed records from result.csv", t.baseName, len(processedSet))
+					}
+				} else {
+					// 回退到加载result.csv
+					set, _, err := loadProcessedSet(t.resultPath)
+					if err != nil {
+						return fmt.Errorf("load processed set failed: %w", err)
+					}
+					processedSet = set
+					log.Printf("[RESUME-CSV] %s: loaded %d processed records from result.csv", t.baseName, len(processedSet))
+				}
+			}
+		} else {
+			// 数据库不存在，必须加载result.csv
+			set, _, err := loadProcessedSet(t.resultPath)
+			if err != nil {
+				return fmt.Errorf("load processed set failed: %w", err)
+			}
+			processedSet = set
+			log.Printf("[RESUME-CSV] %s: loaded %d processed records from result.csv", t.baseName, len(processedSet))
 		}
-		processedSet = set
-		log.Printf("[RESUME] detected existing result.csv, processed=%d", len(processedSet))
 	}
 	qp, err := NewQueryProcessor(ctx, t.dbPath, t.resultPath, "db/job_graph.db", opts.queryWorkers, opts.embBatch, opts.chromaTopK, opts.embTimeout, opts.trace, opts.limitJobs, appendMode, processedSet, opts.minSim)
 	if err != nil {
@@ -1837,4 +2420,65 @@ func (s *DatabaseService) CountProcessed(ctx context.Context) (int, error) {
 func (s *DatabaseService) MarkProcessed(ctx context.Context, mid string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE jobs SET status='处理完成' WHERE mid=?`, mid)
 	return err
+}
+
+// MarkProcessedBatch 批量更新状态，显著减少事务开销
+func (s *DatabaseService) MarkProcessedBatch(ctx context.Context, mids []string) error {
+	if len(mids) == 0 {
+		return nil
+	}
+
+	// 使用事务批量更新
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 准备批量更新语句
+	stmt, err := tx.PrepareContext(ctx, `UPDATE jobs SET status='处理完成' WHERE mid=?`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+	defer stmt.Close()
+
+	// 批量执行
+	for _, mid := range mids {
+		if _, err := stmt.ExecContext(ctx, mid); err != nil {
+			return fmt.Errorf("failed to update mid %s: %w", mid, err)
+		}
+	}
+
+	// 提交事务
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// MarkProcessedBatchWithChunk 分块批量更新，避免SQL语句过长
+func (s *DatabaseService) MarkProcessedBatchWithChunk(ctx context.Context, mids []string, chunkSize int) error {
+	if len(mids) == 0 {
+		return nil
+	}
+
+	if chunkSize <= 0 {
+		chunkSize = 100 // 默认分块大小
+	}
+
+	// 分块处理
+	for i := 0; i < len(mids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(mids) {
+			end = len(mids)
+		}
+
+		chunk := mids[i:end]
+		if err := s.MarkProcessedBatch(ctx, chunk); err != nil {
+			return fmt.Errorf("failed to process chunk %d-%d: %w", i, end, err)
+		}
+	}
+
+	return nil
 }
