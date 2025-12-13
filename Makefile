@@ -27,7 +27,7 @@ INPUT ?= $(PLATFORM_DIR)/*.csv
 # 单文件处理：默认一次只处理 1 个 CSV，避免同时多文件导致系统卡顿
 QUERY_WORKERS ?= 48
 # 收敛批量，降低单次 /api/embed 压力，减少超时
-EMB_BATCH ?= 256
+EMB_BATCH ?= 512
 EMB_TIMEOUT ?= 600s
 # Chroma 仅取前 5 个候选，加快查询与反序列化
 CHROMA_TOPK ?= 5
@@ -47,7 +47,9 @@ CHROMA_CONTAINER ?= job-classifier-chroma
 .PHONY: init start run log stop
 
 init:
-	@echo "== 检查 Ollama 服务 =="; \
+	@bash -lc '\
+	set -eo pipefail; \
+	echo "== 检查 Ollama 服务 =="; \
 	if ! command -v ollama >/dev/null 2>&1; then \
 		echo "未找到 ollama 命令，请先安装 Ollama。"; exit 1; \
 	fi; \
@@ -58,9 +60,7 @@ init:
 		echo "模型 $(EMB_MODEL) 已存在。"; \
 	else \
 		echo "模型 $(EMB_MODEL) 未找到，开始拉取..."; \
-		if ! ollama pull "$(EMB_MODEL)"; then \
-			echo "模型 $(EMB_MODEL) 拉取失败，请检查网络后重试"; exit 1; \
-		fi; \
+		ollama pull "$(EMB_MODEL)"; \
 	fi; \
 	echo ""; \
 	echo "== 检查 Chroma 服务（Docker） =="; \
@@ -68,7 +68,6 @@ init:
 		echo "未找到 docker 命令，请先安装/启动 Docker Desktop。"; exit 1; \
 	fi; \
 	echo "重建 Chroma 容器 $(CHROMA_CONTAINER)，使用性能优先参数..."; \
-		: # 若 8000 端口已被其它容器占用，先清理掉；避免 bind 失败 \
 	old8000=$$(docker ps -aq --filter "publish=8000"); \
 	if [ -n "$$old8000" ]; then \
 		echo "检测到占用 8000 端口的容器：$$old8000，正在移除..."; \
@@ -104,7 +103,8 @@ init:
 	go run ./cmd/jobimport; \
 	echo "2) 构建职业知识图谱（cmd/jobgraph）..."; \
 	go run ./cmd/jobgraph --db=db/job_graph.db; \
-	echo "init 完成。"
+	echo "init 完成。"; \
+	'
 
 run:
 	@set -e; \
