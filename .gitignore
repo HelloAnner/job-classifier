@@ -12,3 +12,6 @@ test/
 *.pid
 db/
 stats/.env
+show/.env
+show/dist/
+show/out/

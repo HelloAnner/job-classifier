@@ -1,0 +1,11 @@
+.PHONY: test
+
+test:
+	@echo "Building..."
+	@cd server && GOOS=darwin GOARCH=arm64 go build -o ../out/server-darwin-arm64 .
+	@echo "Starting server..."
+	@cd out && ./server-darwin-arm64 &
+	@sleep 3
+	@echo "Testing..."
+	@curl -s http://127.0.0.1:38866/ | head -20
+	@pkill -f server-darwin-arm64

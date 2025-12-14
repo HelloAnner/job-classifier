@@ -1,0 +1,8 @@
+# 编译输出
+server/server
+dist/*
+!dist/.gitkeep
+
+# 临时文件
+*.log
+*.pid
