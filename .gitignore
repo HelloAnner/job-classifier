@@ -11,3 +11,4 @@ output/
 test/
 *.pid
 db/
+stats/.env
