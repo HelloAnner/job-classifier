@@ -1,7 +1,6 @@
 package scanner
 
 import (
-	"bufio"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +9,7 @@ import (
 // SourceInfo 原始文件信息
 type SourceInfo struct {
 	FileName string // 文件名(不含扩展名)
-	Lines    int    // 行数
+	Lines    int    // 数据行数（CSV records，排除 header）
 }
 
 // ScanSource 扫描原始目录，返回所有 CSV 文件信息
@@ -32,7 +31,7 @@ func ScanSource(sourceDir string) (map[string]*SourceInfo, error) {
 		}
 
 		filePath := filepath.Join(sourceDir, name)
-		lines, err := countLines(filePath)
+		lines, err := countCSVDataRows(filePath, CSVCountSpec{HasHeader: true, MinCols: 2, KeyCol: 0})
 		if err != nil {
 			continue
 		}
@@ -46,24 +45,4 @@ func ScanSource(sourceDir string) (map[string]*SourceInfo, error) {
 	}
 
 	return result, nil
-}
-
-// countLines 计算文件行数
-func countLines(filePath string) (int, error) {
-	f, err := os.Open(filePath)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	// 增大缓冲区以处理长行
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024)
-
-	count := 0
-	for scanner.Scan() {
-		count++
-	}
-	return count, scanner.Err()
 }

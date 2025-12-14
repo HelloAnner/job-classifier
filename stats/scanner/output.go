@@ -53,29 +53,38 @@ func (s *OutputScanner) Scan(sourceFiles map[string]*SourceInfo) (*model.ScanRes
 
 		// 查找对应的输出目录
 		if outputPath, ok := outputDirs[baseName]; ok {
-			fp.ResultLines = s.getLineCount(filepath.Join(outputPath, "result.csv"))
-			fp.IgnoreLines = s.getLineCount(filepath.Join(outputPath, "ignore.csv"))
+			// 优先使用 count.txt 作为“已完成且对账通过”的权威来源（combine 会严格校验后再写入）
+			countPath := filepath.Join(outputPath, "count.txt")
+			if ci, err := ReadCountInfo(countPath); err == nil && ci.Valid() {
+				fp.SourceLines = ci.Total
+				fp.ResultLines = ci.Processed
+				fp.IgnoreLines = ci.Filtered
+				fp.ProcessedPct = 100
+			} else {
+				fp.ResultLines = s.getDataRowCount(filepath.Join(outputPath, "result.csv"), true)
+				fp.IgnoreLines = s.getDataRowCount(filepath.Join(outputPath, "ignore.csv"), true)
+			}
 		}
 
-		// 计算进度百分比(减去 header 行)
+		// 计算进度百分比（本模块已按 CSV record 计数，天然排除 header；并且处理完成必须满足 source == result + ignore）
 		processed := fp.ResultLines + fp.IgnoreLines
-		if processed > 0 {
-			processed-- // result.csv 有 header
-		}
-		if fp.IgnoreLines > 0 {
-			processed-- // ignore.csv 有 header
-		}
-		
-		sourceData := srcInfo.Lines - 1 // 原始文件减去 header
-		if sourceData > 0 {
-			fp.ProcessedPct = float64(processed) / float64(sourceData) * 100
-			if fp.ProcessedPct > 100 {
+		if fp.SourceLines > 0 && fp.ProcessedPct < 100 {
+			if processed == fp.SourceLines {
 				fp.ProcessedPct = 100
+			} else {
+				fp.ProcessedPct = float64(processed) / float64(fp.SourceLines) * 100
+				// 避免“超 100% 但实际不对账”被前端误判为已完成
+				if fp.ProcessedPct > 99.9 {
+					fp.ProcessedPct = 99.9
+				}
+				if fp.ProcessedPct < 0 {
+					fp.ProcessedPct = 0
+				}
 			}
 		}
 
 		result.Files = append(result.Files, fp)
-		result.TotalLines += sourceData
+		result.TotalLines += fp.SourceLines
 		result.ProcessedLines += processed
 		result.TotalFiles++
 
@@ -91,8 +100,8 @@ func (s *OutputScanner) Scan(sourceFiles map[string]*SourceInfo) (*model.ScanRes
 	return result, nil
 }
 
-// getLineCount 获取文件行数，使用缓存优化
-func (s *OutputScanner) getLineCount(filePath string) int {
+// getDataRowCount 获取 CSV 数据行数（CSV records，排除 header），使用缓存优化
+func (s *OutputScanner) getDataRowCount(filePath string, hasHeader bool) int {
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return 0
@@ -103,20 +112,44 @@ func (s *OutputScanner) getLineCount(filePath string) int {
 	s.mu.RUnlock()
 
 	// 如果修改时间未变，直接返回缓存
-	if exists && cached.ModTime.Equal(info.ModTime()) {
+	if exists && cached.ModTime.Equal(info.ModTime()) && cached.Size == info.Size() {
 		return cached.Lines
 	}
 
-	// 重新计算行数
-	lines, err := countLines(filePath)
-	if err != nil {
-		return 0
+	lines := 0
+	if filepath.Base(filePath) == "result.csv" {
+		// result.csv 每条记录是单行（combine 会清洗掉字段内换行），可用增量统计换行数，保证 3 秒刷新。
+		if exists && info.Size() >= cached.Size {
+			delta, err := countNewlinesFromOffset(filePath, cached.Size)
+			if err == nil {
+				lines = cached.Lines + delta
+			}
+		}
+		if lines == 0 {
+			nl, err := countNewlinesFromOffset(filePath, 0)
+			if err != nil {
+				return 0
+			}
+			if hasHeader && nl > 0 {
+				lines = nl - 1
+			} else {
+				lines = nl
+			}
+		}
+	} else {
+		// 重新计算数据行数（对 ignore：可能存在字段内换行，只能用 CSV 解析按 record 统计）
+		n, err := countCSVDataRows(filePath, CSVCountSpec{HasHeader: hasHeader, MinCols: 1, KeyCol: 0})
+		if err != nil {
+			return 0
+		}
+		lines = n
 	}
 
 	s.mu.Lock()
 	s.cache[filePath] = &model.FileCache{
 		ModTime: info.ModTime(),
 		Lines:   lines,
+		Size:    info.Size(),
 	}
 	s.mu.Unlock()
 
