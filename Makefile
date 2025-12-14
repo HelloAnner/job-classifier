@@ -27,7 +27,7 @@ INPUT ?= $(PLATFORM_DIR)/*.csv
 # 单文件处理：默认一次只处理 1 个 CSV，避免同时多文件导致系统卡顿
 QUERY_WORKERS ?= 48
 # 收敛批量，降低单次 /api/embed 压力，减少超时
-EMB_BATCH ?= 512
+EMB_BATCH ?= 15
 EMB_TIMEOUT ?= 600s
 # Chroma 仅取前 5 个候选，加快查询与反序列化
 CHROMA_TOPK ?= 5
