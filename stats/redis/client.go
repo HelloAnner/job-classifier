@@ -133,11 +133,26 @@ func mergeResults(old *model.ScanResult, partial *model.ScanResult) *model.ScanR
             continue
         }
         if pos, ok := idx[nf.FileName]; ok {
-            // 已存在：仅当本机观察到输出才考虑覆盖，且避免回退
+            // 已存在：按权威/非权威优先级合并
+            of := old.Files[pos]
+            if nf.Authoritative && !of.Authoritative {
+                old.Files[pos] = cloneFile(nf)
+                continue
+            }
+            if of.Authoritative && !nf.Authoritative {
+                // 保留旧的权威数据；但若 partial 的数值更大且差距显著（>1%），则接受覆盖以修复潜在权威失真
+                op := of.ResultLines + of.IgnoreLines
+                np := nf.ResultLines + nf.IgnoreLines
+                if op > 0 && float64(np-op)/float64(op) > 0.01 {
+                    old.Files[pos] = cloneFile(nf)
+                }
+                continue
+            }
+            // 同级：仅当本机观察到输出才考虑覆盖，且避免回退
             if !nf.HasOutput {
                 continue
             }
-            op := old.Files[pos].ResultLines + old.Files[pos].IgnoreLines
+            op := of.ResultLines + of.IgnoreLines
             np := nf.ResultLines + nf.IgnoreLines
             if np >= op {
                 old.Files[pos] = cloneFile(nf)

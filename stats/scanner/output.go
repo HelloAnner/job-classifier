@@ -61,6 +61,7 @@ func (s *OutputScanner) Scan(sourceFiles map[string]*SourceInfo) (*model.ScanRes
                 fp.IgnoreLines = ci.Filtered
                 fp.ProcessedPct = 100
                 fp.HasOutput = true
+                fp.Authoritative = true
             } else {
                 resultCount := s.getDataRowCount(filepath.Join(outputPath, "result.csv"), true)
                 ignoreCount := s.getDataRowCount(filepath.Join(outputPath, "ignore.csv"), true)
@@ -72,8 +73,11 @@ func (s *OutputScanner) Scan(sourceFiles map[string]*SourceInfo) (*model.ScanRes
             }
         }
 
-		// 计算进度百分比（本模块已按 CSV record 计数，天然排除 header；并且处理完成必须满足 source == result + ignore）
-		processed := fp.ResultLines + fp.IgnoreLines
+            // 兜底修正：若未从 count.txt 读取到权威数据，但 result+ignore 与 SourceLines 完全相等，则视为 100% 完成
+            processed := fp.ResultLines + fp.IgnoreLines
+            if !fp.Authoritative && fp.SourceLines > 0 && processed == fp.SourceLines {
+                fp.ProcessedPct = 100
+            }
 		if fp.SourceLines > 0 && fp.ProcessedPct < 100 {
 			if processed == fp.SourceLines {
 				fp.ProcessedPct = 100
@@ -122,34 +126,13 @@ func (s *OutputScanner) getDataRowCount(filePath string, hasHeader bool) int {
 		return cached.Lines
 	}
 
-	lines := 0
-	if filepath.Base(filePath) == "result.csv" {
-		// result.csv 每条记录是单行（combine 会清洗掉字段内换行），可用增量统计换行数，保证 3 秒刷新。
-		if exists && info.Size() >= cached.Size {
-			delta, err := countNewlinesFromOffset(filePath, cached.Size)
-			if err == nil {
-				lines = cached.Lines + delta
-			}
-		}
-		if lines == 0 {
-			nl, err := countNewlinesFromOffset(filePath, 0)
-			if err != nil {
-				return 0
-			}
-			if hasHeader && nl > 0 {
-				lines = nl - 1
-			} else {
-				lines = nl
-			}
-		}
-	} else {
-		// 重新计算数据行数（对 ignore：可能存在字段内换行，只能用 CSV 解析按 record 统计）
-		n, err := countCSVDataRows(filePath, CSVCountSpec{HasHeader: hasHeader, MinCols: 1, KeyCol: 0})
-		if err != nil {
-			return 0
-		}
-		lines = n
-	}
+    // 统一按 CSV record 计数（对 result/ignore 都一致），避免字段内换行导致的 wc/newline 偏差。
+    // 性能：依赖文件修改时间与大小缓存，仅在文件发生变化时全量重数。
+    n, err := countCSVDataRows(filePath, CSVCountSpec{HasHeader: hasHeader, MinCols: 1, KeyCol: 0})
+    if err != nil {
+        return 0
+    }
+    lines := n
 
 	s.mu.Lock()
 	s.cache[filePath] = &model.FileCache{

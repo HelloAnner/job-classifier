@@ -12,20 +12,39 @@ import (
 func processSingleCSV(ctx context.Context, t fileTask, opts options) error {
 	log.Printf("[START] %s -> %s", t.csvPath, t.outDir)
 
-	// 启动检查：若 count.txt 存在且自洽，则直接跳过该目录（不再扫描/对账该目录下的其它文件）。
-	if ci, err := readCountInfo(t.countPath); err == nil {
-		if ci.Valid() {
-			if _, err := os.Stat(t.dbPath); err == nil {
-				log.Printf("[SKIP] %s: valid count.txt found (total=%d processed=%d filtered=%d db=%d)", t.baseName, ci.Total, ci.Processed, ci.Filtered, ci.DB)
-				return nil
-			}
-			_ = os.Remove(t.countPath)
-			log.Printf("[COUNT-RESET] %s: count.txt exists but origin.db missing, removed and will continue", t.baseName)
-		} else {
-			_ = os.Remove(t.countPath)
-			log.Printf("[COUNT-RESET] %s: count.txt invalid, removed and will continue", t.baseName)
-		}
-	}
+    // 启动检查：若 count.txt 存在且自洽，则“默认跳过”。
+    // 但在跳过之前，做一次轻量级历史数据体检：
+    // - 仅检查 result.csv 是否存在重复 job_id；如存在则原地去重（保留首条）。
+    // 这样可以修复“后续追加导致的重复行，但 count.txt 仍然有效”的场景。
+    if ci, err := readCountInfo(t.countPath); err == nil {
+        if ci.Valid() {
+            if _, err := os.Stat(t.dbPath); err == nil {
+                // 轻量去重：仅在发现重复时才改写 result.csv；不触发完整重对账，成本可控。
+                if fixed, fixErr := preflightFixResultDuplicates(t); fixErr != nil {
+                    log.Printf("[WARN] %s: preflight duplicate check failed: %v", t.baseName, fixErr)
+                } else if fixed {
+                    // 去重后尽量刷新 count.txt，使 processed 与文件实际行数一致；
+                    // 若统计不匹配则仅告警，不中断流程。
+                    if rows, err1 := countCSVRows(t.resultPath); err1 == nil {
+                        if ig, err2 := countCSVRows(t.ignorePath); err2 == nil {
+                            if dbAll, _, err3 := countDBAllAndFiltered(context.Background(), t.dbPath); err3 == nil {
+                                if err := writeCountStrict(t.countPath, ci.Total, rows, ig, dbAll); err != nil {
+                                    log.Printf("[WARN] %s: update count.txt after dedup failed: %v (rows=%d ignore=%d db=%d total=%d)", t.baseName, err, rows, ig, dbAll, ci.Total)
+                                }
+                            }
+                        }
+                    }
+                }
+                log.Printf("[SKIP] %s: valid count.txt found (total=%d processed=%d filtered=%d db=%d)", t.baseName, ci.Total, ci.Processed, ci.Filtered, ci.DB)
+                return nil
+            }
+            _ = os.Remove(t.countPath)
+            log.Printf("[COUNT-RESET] %s: count.txt exists but origin.db missing, removed and will continue", t.baseName)
+        } else {
+            _ = os.Remove(t.countPath)
+            log.Printf("[COUNT-RESET] %s: count.txt invalid, removed and will continue", t.baseName)
+        }
+    }
 
 	// 尝试多轮修复：去重/补漏/回填，直到三方数据一致再写 count.txt
 	for attempt := 1; attempt <= 3; attempt++ {

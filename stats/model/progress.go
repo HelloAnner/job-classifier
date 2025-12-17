@@ -15,13 +15,14 @@ import "time"
 
 // FileProgress 单个文件的处理进度
 type FileProgress struct {
-	FileName     string    `json:"file_name"`     // 原始 CSV 文件名
-	SourceLines  int       `json:"source_lines"`  // 原始文件行数
-	ResultLines  int       `json:"result_lines"`  // result.csv 行数
-	IgnoreLines  int       `json:"ignore_lines"`  // ignore.csv 行数
-	ProcessedPct float64   `json:"processed_pct"` // 处理进度百分比
-	UpdatedAt    time.Time `json:"updated_at"`    // 最后更新时间
-	HasOutput    bool      `json:"-"`             // 本机是否观察到输出（本地合并用；不写入 Redis JSON）
+    FileName     string    `json:"file_name"`     // 原始 CSV 文件名
+    SourceLines  int       `json:"source_lines"`  // 原始文件行数
+    ResultLines  int       `json:"result_lines"`  // result.csv 行数
+    IgnoreLines  int       `json:"ignore_lines"`  // ignore.csv 行数
+    ProcessedPct float64   `json:"processed_pct"` // 处理进度百分比
+    UpdatedAt    time.Time `json:"updated_at"`    // 最后更新时间
+    HasOutput    bool      `json:"-"`             // 本机是否观察到输出（本地合并用；不写入 Redis JSON）
+    Authoritative bool     `json:"-"`             // 是否来自权威来源（count.txt）；合并时优先
 }
 
 // ScanResult 扫描结果汇总

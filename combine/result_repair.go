@@ -159,3 +159,75 @@ func rewriteResultCSVDedupAndDrop(resultPath string, dropMIDs map[string]struct{
 
 	return seen, kept, nil
 }
+
+// preflightFixResultDuplicates 在“跳过处理”前做一次低成本体检：
+// - 若 result.csv 不存在或为空：不处理；
+// - 若存在重复 job_id，则按“保留首条”的策略去重；
+// - 不检查/修改分类内容，仅保证一条 mid 只保留一行，避免统计口径混乱。
+// 返回值：
+// - fixed=true 表示确实执行了去重并改写了文件；
+// - error 非空表示 IO/解析失败（调用方应忽略错误，仅告警）。
+func preflightFixResultDuplicates(t fileTask) (fixed bool, err error) {
+    f, err := os.Open(t.resultPath)
+    if err != nil {
+        if os.IsNotExist(err) {
+            return false, nil
+        }
+        return false, err
+    }
+    defer f.Close()
+
+    r := csv.NewReader(bufio.NewReader(f))
+    r.ReuseRecord = true
+    r.LazyQuotes = true
+    r.FieldsPerRecord = -1
+
+    header, err := r.Read()
+    if err != nil {
+        if err == io.EOF {
+            return false, nil
+        }
+        return false, err
+    }
+    jobIdx := 0
+    for i, h := range header {
+        if strings.TrimSpace(h) == "job_id" {
+            jobIdx = i
+            break
+        }
+    }
+
+    seen := make(map[string]struct{}, 1024)
+    dup := false
+    for {
+        rec, err := r.Read()
+        if err != nil {
+            if err == io.EOF {
+                break
+            }
+            return false, err
+        }
+        if jobIdx >= len(rec) {
+            continue
+        }
+        mid := strings.TrimSpace(rec[jobIdx])
+        if mid == "" {
+            continue
+        }
+        if _, ok := seen[mid]; ok {
+            dup = true
+            break
+        }
+        seen[mid] = struct{}{}
+    }
+
+    if !dup {
+        return false, nil
+    }
+
+    // 发现重复，执行一次去重改写（保留首条），不做 drop 逻辑。
+    if _, _, err := rewriteResultCSVDedupAndDrop(t.resultPath, nil); err != nil {
+        return false, err
+    }
+    return true, nil
+}
