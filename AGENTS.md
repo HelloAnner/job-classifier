@@ -32,3 +32,9 @@
 
 - Go：优先执行 `gofmt` 与 `go test ./...`，保证编译通过。
 
+## 7. stats 并发上报（约定）
+
+- Redis 上报改为“按文件合并”：每次上报先读取 Redis 现有 JSON，仅覆盖本机有输出的文件项，避免多个电脑互相覆盖进度；随后重算 totals/overall 并原子写入。
+- 原子性：使用 Redis `WATCH + TxPipelined` + 重试，防止并发丢写；出现进度回退会被抑制（新 processed < 旧值不覆盖）。
+- 兼容性：JSON 结构与旧版一致；仅在内存结构里增加 `FileProgress.HasOutput`（不序列化）。
+- 建议：不同数据集可用不同 `REDIS_KEY` 隔离（例如 `58tong.progress`）。

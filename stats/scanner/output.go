@@ -44,27 +44,33 @@ func (s *OutputScanner) Scan(sourceFiles map[string]*SourceInfo) (*model.ScanRes
 		}
 	}
 
-	for baseName, srcInfo := range sourceFiles {
-		fp := &model.FileProgress{
-			FileName:    baseName,
-			SourceLines: srcInfo.Lines,
-			UpdatedAt:   time.Now(),
-		}
+    for baseName, srcInfo := range sourceFiles {
+        fp := &model.FileProgress{
+            FileName:    baseName,
+            SourceLines: srcInfo.Lines,
+            UpdatedAt:   time.Now(),
+        }
 
 		// 查找对应的输出目录
-		if outputPath, ok := outputDirs[baseName]; ok {
-			// 优先使用 count.txt 作为“已完成且对账通过”的权威来源（combine 会严格校验后再写入）
-			countPath := filepath.Join(outputPath, "count.txt")
-			if ci, err := ReadCountInfo(countPath); err == nil && ci.Valid() {
-				fp.SourceLines = ci.Total
-				fp.ResultLines = ci.Processed
-				fp.IgnoreLines = ci.Filtered
-				fp.ProcessedPct = 100
-			} else {
-				fp.ResultLines = s.getDataRowCount(filepath.Join(outputPath, "result.csv"), true)
-				fp.IgnoreLines = s.getDataRowCount(filepath.Join(outputPath, "ignore.csv"), true)
-			}
-		}
+        if outputPath, ok := outputDirs[baseName]; ok {
+            // 优先使用 count.txt 作为“已完成且对账通过”的权威来源（combine 会严格校验后再写入）
+            countPath := filepath.Join(outputPath, "count.txt")
+            if ci, err := ReadCountInfo(countPath); err == nil && ci.Valid() {
+                fp.SourceLines = ci.Total
+                fp.ResultLines = ci.Processed
+                fp.IgnoreLines = ci.Filtered
+                fp.ProcessedPct = 100
+                fp.HasOutput = true
+            } else {
+                resultCount := s.getDataRowCount(filepath.Join(outputPath, "result.csv"), true)
+                ignoreCount := s.getDataRowCount(filepath.Join(outputPath, "ignore.csv"), true)
+                fp.ResultLines = resultCount
+                fp.IgnoreLines = ignoreCount
+                if resultCount > 0 || ignoreCount > 0 {
+                    fp.HasOutput = true
+                }
+            }
+        }
 
 		// 计算进度百分比（本模块已按 CSV record 计数，天然排除 header；并且处理完成必须满足 source == result + ignore）
 		processed := fp.ResultLines + fp.IgnoreLines

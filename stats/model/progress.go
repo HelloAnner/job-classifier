@@ -1,5 +1,16 @@
 package model
 
+//
+// 进度与汇总模型定义
+//
+// 说明：
+// - 本文件仅定义数据结构，不包含业务逻辑。
+// - 为支持多机并发上报 Redis 的“按文件粒度合并”，新增了 FileProgress.HasOutput 字段，
+//   仅用于本地合并策略判断，JSON 序列化时忽略，不影响现有前端/消费方兼容性。
+//
+// 作者: Anner
+// 创建时间: 2025/12/17
+
 import "time"
 
 // FileProgress 单个文件的处理进度
@@ -10,6 +21,7 @@ type FileProgress struct {
 	IgnoreLines  int       `json:"ignore_lines"`  // ignore.csv 行数
 	ProcessedPct float64   `json:"processed_pct"` // 处理进度百分比
 	UpdatedAt    time.Time `json:"updated_at"`    // 最后更新时间
+	HasOutput    bool      `json:"-"`             // 本机是否观察到输出（本地合并用；不写入 Redis JSON）
 }
 
 // ScanResult 扫描结果汇总
