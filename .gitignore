@@ -15,3 +15,5 @@ stats/.env
 show/.env
 show/dist/
 show/out/
+.DS_Store
+**/.DS_Store
